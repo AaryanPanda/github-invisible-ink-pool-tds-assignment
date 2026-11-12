@@ -7,13 +7,8 @@ services:
     startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: DATABASE_URL
-        fromDatabase:
-          name: invisible-ink-db
-          property: connectionString
+        sync: false          # paste your existing Postgres "Internal Database URL" when asked
       - key: ADMIN_TOKEN
         generateValue: true
       - key: PYTHON_VERSION
         value: 3.12.7
-databases:
-  - name: invisible-ink-db
-    plan: free
