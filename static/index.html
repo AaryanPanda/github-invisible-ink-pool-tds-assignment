@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Invisible Ink Pool · TDS</title>
+<style>
+:root{--bg:#f7f6f2;--card:#fff;--ink:#1b1b1f;--mut:#6b6b74;--acc:#2b59c3;--ok:#1f8a4c;--bad:#c0392b;--line:#e4e2dc}
+*{box-sizing:border-box}body{margin:0;font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--ink)}
+main{max-width:980px;margin:0 auto;padding:28px 18px 60px}
+h1{font-size:26px;margin:0 0 4px}h2{font-size:17px;margin:0 0 12px}.sub{color:var(--mut);margin:0 0 22px}
+.grid{display:grid;gap:14px}.kpis{grid-template-columns:repeat(auto-fit,minmax(170px,1fr));margin-bottom:14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px}
+.kpi .n{font-size:30px;font-weight:700}.kpi .l{color:var(--mut);font-size:13px}
+.two{grid-template-columns:1fr 1fr}@media(max-width:760px){.two{grid-template-columns:1fr}}
+#drop{border:2px dashed var(--line);border-radius:10px;padding:26px;text-align:center;color:var(--mut);cursor:pointer;transition:.15s}
+#drop.hover{border-color:var(--acc);background:#eef2fb;color:var(--acc)}
+input[type=text]{width:100%;padding:9px 10px;border:1px solid var(--line);border-radius:8px;font:inherit;margin:10px 0}
+button,.btn{display:inline-block;background:var(--acc);color:#fff;border:0;border-radius:8px;padding:10px 14px;font:inherit;font-weight:600;cursor:pointer;text-decoration:none;margin:4px 6px 4px 0}
+.btn.sec{background:#fff;color:var(--acc);border:1px solid var(--acc)}
+#msg{margin-top:10px;font-size:14px;white-space:pre-line}.ok{color:var(--ok)}.bad{color:var(--bad)}
+.bars{display:grid;grid-template-columns:repeat(17,1fr);gap:4px;align-items:end;height:130px;margin-top:8px}
+.bar{background:var(--acc);border-radius:3px 3px 0 0;min-height:2px;position:relative}
+.bar span{position:absolute;top:-17px;left:0;right:0;text-align:center;font-size:10px;color:var(--mut)}
+.lbls{display:grid;grid-template-columns:repeat(17,1fr);gap:4px;text-align:center;font-weight:600;font-size:12px;margin-top:4px}
+table{width:100%;border-collapse:collapse;font-size:13px}td,th{padding:6px 4px;border-bottom:1px solid var(--line);text-align:left}th{color:var(--mut);font-weight:500}
+code{background:#f0efe9;padding:1px 5px;border-radius:4px;font-size:13px}ol{padding-left:20px;margin:0}li{margin:4px 0}
+.del{background:var(--bad);padding:3px 8px;font-size:12px}
+.res{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px;margin-top:12px}
+.res .card{padding:12px}.res img{width:100%;border-radius:6px;border:1px solid var(--line)}
+.guess{font:700 22px ui-monospace,Menlo,monospace;letter-spacing:3px}.alts{color:var(--mut);font:13px ui-monospace,Menlo,monospace}
+#pdrop{border:2px dashed var(--acc);border-radius:10px;padding:22px;text-align:center;color:var(--acc);cursor:pointer;background:#f3f6fd}
+#pdrop.hover{background:#e4ebfa}.status{font-size:13px;color:var(--mut);margin:8px 0 0}
+</style></head><body><main>
+<h1>Invisible Ink Pool</h1>
+<p class="sub">Shared training data for the TDS <b>Invisible Ink</b> bonus. Upload your <b>60 labelled examples</b> and download everyone's examples merged, with duplicates removed.</p>
+
+<div class="grid kpis">
+  <div class="card kpi"><div class="n" id="k1">–</div><div class="l">unique recordings in the pool</div></div>
+  <div class="card kpi"><div class="n" id="k2">–</div><div class="l">files uploaded</div></div>
+  <div class="card kpi"><div class="n" id="k3">–</div><div class="l">records uploaded (incl. duplicates)</div></div>
+  <div class="card kpi"><div class="n" id="k4">–</div><div class="l">rarest letter</div></div>
+</div>
+
+<div class="card" style="margin-bottom:14px;border-color:var(--acc)">
+  <h2>⚡ Predict during the game</h2>
+  <div id="pdrop">Drop the downloaded test recordings here (up to 12 files)<br>or click to choose</div>
+  <input type="file" id="pfile" accept=".jsonl,.json,.txt" multiple hidden>
+  <p class="status" id="mstat">Loading model status…</p>
+  <div id="pmsg"></div>
+  <div id="pcopy"></div>
+  <div class="res" id="res"></div>
+  <p class="status">Test recordings are processed in memory and never stored. Black lines show the predicted ink and red dotted lines show where one letter ends and the next begins. Read the picture yourself; the auto guess gets about 40% of letters right. Use the top 3 options when two letters look alike.</p>
+</div>
+
+<div class="grid two">
+  <div class="card">
+    <h2>1 · Upload your training file</h2>
+    <div id="drop">Drop <code>air-ink-training-60.jsonl</code> here<br>or click to choose (several files are fine)</div>
+    <input type="file" id="file" accept=".jsonl,.json,.txt" multiple hidden>
+    <input type="text" id="note" placeholder="Nickname (optional, shown publicly)">
+    <div id="msg"></div>
+    <p style="color:var(--mut);font-size:13px;margin:10px 0 0">Upload only <b>training</b> files that include answers. Live-session test files have no answers and will be rejected. Duplicates are detected from the motion data itself, so re-uploads never inflate the pool.</p>
+  </div>
+  <div class="card">
+    <h2>2 · Download</h2>
+    <a class="btn" href="/download/pool.jsonl">Pooled data (.jsonl)</a>
+    <a class="btn sec" href="/download/invisible_ink.py">Predictor script</a>
+    <a class="btn sec" href="/download/all.zip">Everything (ZIP)</a>
+    <a class="btn sec" href="/download/model.pkl">Trained model</a>
+    <h2 style="margin-top:16px">3 · Use it</h2>
+    <ol>
+      <li><code>pip install numpy scipy scikit-learn scikit-image matplotlib</code></li>
+      <li><code>python invisible_ink.py train air-ink-pool.jsonl</code></li>
+      <li>In the live game, download the 6 recordings, then<br><code>python invisible_ink.py predict *.json --out out</code></li>
+      <li>Open <code>out/drawing_N.png</code>. Read the black ink yourself, and use the auto guess for letters you can't tell apart.</li>
+    </ol>
+  </div>
+</div>
+
+<div class="card" style="margin-top:14px">
+  <h2>Examples of each letter (more is better for the auto-reader)</h2>
+  <div class="bars" id="bars"></div><div class="lbls" id="lbls"></div>
+</div>
+
+<div class="card" style="margin-top:14px">
+  <h2>Recent uploads</h2>
+  <table><thead><tr><th>#</th><th>When (UTC)</th><th>File</th><th>Nickname</th><th>Records</th><th>New</th><th id="admh"></th></tr></thead><tbody id="ups"></tbody></table>
+</div>
+</main>
+<script>
+const admin=new URLSearchParams(location.search).has('admin');
+const $=id=>document.getElementById(id);
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+async function load(){
+  const s=await (await fetch('/api/stats')).json();
+  $('k1').textContent=s.unique_recordings;$('k2').textContent=s.uploads;$('k3').textContent=s.total_records_uploaded;
+  const L=Object.entries(s.letters);const mx=Math.max(1,...L.map(x=>x[1]));
+  const r=L.slice().sort((a,b)=>a[1]-b[1])[0];$('k4').textContent=r?`${r[0]} · ${r[1]}`:'–';
+  $('bars').innerHTML=L.map(([k,v])=>`<div class="bar" style="height:${v/mx*100}%"><span>${v}</span></div>`).join('');
+  $('lbls').innerHTML=L.map(([k])=>`<div>${k}</div>`).join('');
+  mstatus(s.model);if(admin)$('admh').textContent='Admin';
+  $('ups').innerHTML=s.recent.map(u=>`<tr><td>${u.id}</td><td>${esc(u.when.replace('T',' '))}</td><td>${esc(u.file)}</td><td>${esc(u.note)}</td><td>${u.records}</td><td>${u.new}</td>${admin?`<td><button class="del" onclick="del(${u.id})">Delete</button></td>`:''}</tr>`).join('')||'<tr><td colspan="6">No uploads yet. Be the first!</td></tr>';
+}
+async function send(files){
+  for(const f of files){
+    const fd=new FormData();fd.append('file',f);fd.append('note',$('note').value);
+    $('msg').className='';$('msg').textContent=`Uploading ${f.name}…`;
+    try{
+      const res=await fetch('/api/upload',{method:'POST',body:fd});const j=await res.json();
+      if(!res.ok)throw new Error(j.detail||res.statusText);
+      $('msg').className='ok';
+      $('msg').textContent=`✓ ${f.name}: ${j.records} recordings, ${j.new} new, ${j.duplicates} already in pool. Pool now ${j.pool_size}.`+(j.skipped.length?`\nSkipped: ${j.skipped.join('; ')}`:'');
+    }catch(e){$('msg').className='bad';$('msg').textContent=`✗ ${f.name}: ${e.message}`}
+  }
+  load();
+}
+async function del(id){
+  const t=prompt('Admin token');if(!t)return;
+  const r=await fetch(`/api/upload/${id}?token=${encodeURIComponent(t)}`,{method:'DELETE'});
+  alert(JSON.stringify(await r.json()));load();
+}
+const d=$('drop');d.onclick=()=>$('file').click();$('file').onchange=e=>send(e.target.files);
+['dragover','dragenter'].forEach(ev=>d.addEventListener(ev,e=>{e.preventDefault();d.classList.add('hover')}));
+['dragleave','drop'].forEach(ev=>d.addEventListener(ev,e=>{e.preventDefault();d.classList.remove('hover')}));
+d.addEventListener('drop',e=>send(e.dataTransfer.files));
+function mstatus(m){
+  let t=m.trained_on?`Model trained on ${m.trained_on} recordings (${m.when.replace('T',' ')} UTC, took ${m.seconds}s).`:'No model yet.';
+  if(m.training)t+=` Retraining with new data… ${m.training_for}s so far (this can take several minutes on the free server; the current model still works).`;
+  if(m.error)t+=` Last training error: ${m.error}`;
+  $('mstat').textContent=t;
+}
+async function predict(files){
+  const fd=new FormData();for(const f of files)fd.append('files',f);
+  $('pmsg').className='';$('pmsg').textContent=`Analysing ${files.length} file(s)… (free server: allow ~10–40 s)`;$('res').innerHTML='';$('pcopy').innerHTML='';
+  try{
+    const r=await fetch('/api/predict',{method:'POST',body:fd});const j=await r.json();
+    if(!r.ok)throw new Error(j.detail||r.statusText);
+    $('pmsg').className='ok';$('pmsg').textContent=`✓ ${j.results.length} drawing(s), model trained on ${j.model_trained_on} recordings`;
+    const all=j.results.map(x=>`Drawing ${x.n}: ${x.guess}`).join('\n');
+    $('pcopy').innerHTML=`<button class="sec btn" id="cp">Copy all guesses</button>`;$('cp').onclick=()=>navigator.clipboard.writeText(all);
+    $('res').innerHTML=j.results.map(x=>`<div class="card"><div><b>#${x.n}</b> <span class="alts">${esc(x.file)} · length ${x.length??'?'}</span></div>
+      <div class="guess">${esc(x.guess)}</div><div class="alts">top-3 per letter: ${x.alts.map(esc).join(' · ')}</div>
+      <a href="data:image/png;base64,${x.png}" target="_blank"><img src="data:image/png;base64,${x.png}"></a></div>`).join('');
+  }catch(e){$('pmsg').className='bad';$('pmsg').textContent='✗ '+e.message}
+}
+const pd=$('pdrop');pd.onclick=()=>$('pfile').click();$('pfile').onchange=e=>predict(e.target.files);
+['dragover','dragenter'].forEach(ev=>pd.addEventListener(ev,e=>{e.preventDefault();pd.classList.add('hover')}));
+['dragleave','drop'].forEach(ev=>pd.addEventListener(ev,e=>{e.preventDefault();pd.classList.remove('hover')}));
+pd.addEventListener('drop',e=>predict(e.dataTransfer.files));
+setInterval(load,15000);
+load();
+</script></body></html>
