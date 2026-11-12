@@ -20,7 +20,7 @@ Session = sessionmaker(bind=engine)
 Base = declarative_base()
 
 class Upload(Base):
-    __tablename__ = "uploads"
+    __tablename__ = "ink_uploads"
     id = Column(Integer, primary_key=True)
     created = Column(DateTime, default=datetime.datetime.utcnow)
     filename = Column(String(300))
@@ -30,18 +30,18 @@ class Upload(Base):
     raw = Column(Text)                  # original file text
 
 class Recording(Base):
-    __tablename__ = "recordings"
+    __tablename__ = "ink_recordings"
     id = Column(Integer, primary_key=True)
     fingerprint = Column(String(64), unique=True, index=True)
     rec_id = Column(String(100))
     code = Column(String(10))
     length = Column(Integer)
-    upload_id = Column(Integer, ForeignKey("uploads.id", ondelete="CASCADE"))
+    upload_id = Column(Integer, ForeignKey("ink_uploads.id", ondelete="CASCADE"))
     created = Column(DateTime, default=datetime.datetime.utcnow)
     body = Column(Text)
 
 class Model(Base):
-    __tablename__ = "models"
+    __tablename__ = "ink_models"
     id = Column(Integer, primary_key=True)
     created = Column(DateTime, default=datetime.datetime.utcnow)
     n_recordings = Column(Integer)
