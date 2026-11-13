@@ -14,7 +14,7 @@ concurrency: { group: train, cancel-in-progress: false }
 jobs:
   train:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -43,7 +43,7 @@ jobs:
           python invisible_ink.py train pool.jsonl --model ink_model.pkl
           SECS=$(( $(date +%s) - START ))
           for i in 1 2 3; do
-            CODE=$(curl -s --max-time 600 -o resp.txt -w "%{http_code}" -X POST "$POOL_URL/api/model?token=$ADMIN_TOKEN" \
+            CODE=$(curl -s --max-time 600 -o resp.txt -w "%{http_code}" -X POST "$POOL_URL/api/model" -H "X-Admin-Token: $ADMIN_TOKEN" \
                    -F "file=@ink_model.pkl" -F "n_recordings=$N" -F "seconds=$SECS")
             echo "Upload attempt $i: HTTP $CODE"; cat resp.txt; echo
             [ "$CODE" = "200" ] && { echo "Uploaded model trained on $N recordings"; exit 0; }
