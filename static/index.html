@@ -118,7 +118,7 @@ async function send(files){
 }
 async function del(id){
   const t=prompt('Admin token');if(!t)return;
-  const r=await fetch(`/api/upload/${id}?token=${encodeURIComponent(t)}`,{method:'DELETE'});
+  const r=await fetch(`/api/upload/${id}`,{method:'DELETE',headers:{'X-Admin-Token':t}});
   alert(JSON.stringify(await r.json()));load();
 }
 const d=$('drop');d.onclick=()=>$('file').click();$('file').onchange=e=>send(e.target.files);
