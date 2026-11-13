@@ -3,7 +3,7 @@ import os, io, json, hashlib, zipfile, datetime, collections
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
 from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse, JSONResponse
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey, LargeBinary, func
-import base64, pickle, subprocess, sys, tempfile, threading, time
+import base64, pickle, time
 from typing import List
 from sqlalchemy.orm import declarative_base, sessionmaker
 
@@ -50,9 +50,7 @@ class Model(Base):
 
 Base.metadata.create_all(engine)
 
-# ---------- background training (separate process, 1 thread, so the site stays responsive) ----------
-TRAIN = {"running": False, "again": False, "last_error": "", "started": None}
-_lock = threading.Lock()
+# ---------- model: trained by GitHub Actions (7 GB RAM), uploaded via /api/model ----------
 _model_cache = {"id": None, "model": None}
 
 def pool_size():
@@ -61,47 +59,10 @@ def pool_size():
 
 def latest_model_meta():
     with Session() as db:
-        m = db.query(Model.id, Model.created, Model.n_recordings, Model.seconds).order_by(Model.id.desc()).first()
-        return m
-
-def _train_worker():
-    while True:
-        try:
-            with tempfile.TemporaryDirectory() as td:
-                pool = os.path.join(td, "pool.jsonl"); out = os.path.join(td, "m.pkl")
-                with Session() as db, open(pool, "w") as f:
-                    rows = db.query(Recording.body).order_by(Recording.id).all()
-                    for (b,) in rows: f.write(b + "\n")
-                n = len(rows)
-                if n < 10:
-                    raise RuntimeError("need at least 10 recordings to train")
-                env = dict(os.environ, OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1", MKL_NUM_THREADS="1")
-                t0 = time.time()
-                r = subprocess.run([sys.executable, os.path.join(HERE, "invisible_ink.py"), "train", pool, "--model", out],
-                                   env=env, capture_output=True, text=True, timeout=3600)
-                if r.returncode != 0:
-                    raise RuntimeError(r.stderr[-800:])
-                with Session() as db:
-                    db.add(Model(n_recordings=n, seconds=int(time.time() - t0), blob=open(out, "rb").read()))
-                    db.commit()
-                    # keep only the 3 newest models
-                    old = [i for (i,) in db.query(Model.id).order_by(Model.id.desc()).offset(3).all()]
-                    if old: db.query(Model).filter(Model.id.in_(old)).delete(synchronize_session=False); db.commit()
-                TRAIN["last_error"] = ""
-        except Exception as e:
-            TRAIN["last_error"] = str(e)[:800]
-        with _lock:
-            if TRAIN["again"]:
-                TRAIN["again"] = False; TRAIN["started"] = time.time(); continue
-            TRAIN["running"] = False; TRAIN["started"] = None
-            return
+        return db.query(Model.id, Model.created, Model.n_recordings, Model.seconds).order_by(Model.id.desc()).first()
 
 def request_training():
-    with _lock:
-        if TRAIN["running"]:
-            TRAIN["again"] = True; return
-        TRAIN["running"] = True; TRAIN["started"] = time.time()
-    threading.Thread(target=_train_worker, daemon=True).start()
+    pass  # training happens on GitHub Actions; see .github/workflows/train.yml
 
 def get_model():
     m = latest_model_meta()
@@ -113,11 +74,7 @@ def get_model():
     return _model_cache["model"], m
 app = FastAPI(title="Invisible Ink Pool")
 
-@app.on_event("startup")
-def _startup():
-    m = latest_model_meta(); n = pool_size()
-    if n >= 10 and (m is None or m.n_recordings != n):
-        request_training()
+
 
 def fingerprint(rec):
     """Content fingerprint: code + tilt readings rounded (ignores id, field order, timestamps)."""
@@ -158,8 +115,7 @@ def home():
 def _model_info():
     m = latest_model_meta()
     return {"trained_on": m.n_recordings if m else 0, "when": m.created.isoformat(timespec="minutes") + "Z" if m else None,
-            "seconds": m.seconds if m else None, "training": TRAIN["running"],
-            "training_for": int(time.time() - TRAIN["started"]) if TRAIN["started"] else None, "error": TRAIN["last_error"]}
+            "seconds": m.seconds if m else None, "pool": pool_size()}
 
 @app.get("/api/stats")
 def stats():
@@ -286,11 +242,30 @@ def predict(files: List[UploadFile] = File(...)):
                     "alts": r["alts"], "png": base64.b64encode(r["png"]).decode()})
     return {"model_trained_on": meta.n_recordings, "results": out}
 
-@app.post("/api/retrain")
-def retrain(token: str = Query("")):
+@app.post("/api/model")
+def upload_model(file: UploadFile = File(...), n_recordings: int = Form(...), seconds: int = Form(0), token: str = Query("")):
+    """Admin only (called by the GitHub Action). The pickle is only ever loaded from this trusted source."""
     if not ADMIN_TOKEN or token != ADMIN_TOKEN:
         raise HTTPException(403, "Bad admin token.")
-    request_training(); return {"ok": True}
+    blob = file.file.read(200 * 1024 * 1024)
+    try:
+        import invisible_ink as ink
+        M = pickle.loads(blob)
+        with Session() as db:
+            body = db.query(Recording.body).first()
+        if body:
+            r = ink.analyze(M, ink.norm_rec(json.loads(body[0])), 1)   # smoke test before accepting
+            assert len(r["guess"]) >= 3
+    except Exception as e:
+        raise HTTPException(400, f"Model failed to load/run: {e}")
+    with Session() as db:
+        db.add(Model(n_recordings=n_recordings, seconds=seconds, blob=blob)); db.commit()
+        old = [i for (i,) in db.query(Model.id).order_by(Model.id.desc()).offset(2).all()]
+        if old:
+            db.query(Model).filter(Model.id.in_(old)).delete(synchronize_session=False); db.commit()
+    _model_cache["id"] = None; _model_cache["model"] = None
+    return {"ok": True, "n_recordings": n_recordings}
+
 
 @app.get("/healthz")
 def health():
