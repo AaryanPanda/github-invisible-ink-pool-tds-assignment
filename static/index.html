@@ -34,8 +34,8 @@ code{background:#f0efe9;padding:1px 5px;border-radius:4px;font-size:13px}ol{padd
 
 <div class="grid kpis">
   <div class="card kpi"><div class="n" id="k1">–</div><div class="l">unique recordings in the pool</div></div>
-  <div class="card kpi"><div class="n" id="k2">–</div><div class="l">files uploaded</div></div>
-  <div class="card kpi"><div class="n" id="k3">–</div><div class="l">records uploaded (incl. duplicates)</div></div>
+  <div class="card kpi"><div class="n" id="k2">–</div><div class="l">files that added new recordings</div></div>
+  <div class="card kpi"><div class="n" id="k3">–</div><div class="l">duplicate recordings skipped</div></div>
   <div class="card kpi"><div class="n" id="k4">–</div><div class="l">rarest letter</div></div>
 </div>
 
@@ -57,7 +57,7 @@ code{background:#f0efe9;padding:1px 5px;border-radius:4px;font-size:13px}ol{padd
     <input type="file" id="file" accept=".jsonl,.json,.txt" multiple hidden>
     <input type="text" id="note" placeholder="Nickname (optional, shown publicly)">
     <div id="msg"></div>
-    <p style="color:var(--mut);font-size:13px;margin:10px 0 0">Upload only <b>training</b> files that include answers. Live-session test files have no answers and will be rejected. Duplicates are detected from the motion data itself, so re-uploads never inflate the pool.</p>
+    <p style="color:var(--mut);font-size:13px;margin:10px 0 0">Upload only <b>training</b> files that include answers. Live-session test files have no answers and will be rejected. Only recordings that are new to the pool are saved; duplicates are detected from the motion data itself and skipped. A file with nothing new is not stored at all.</p>
   </div>
   <div class="card">
     <h2>2 · Download</h2>
@@ -81,8 +81,8 @@ code{background:#f0efe9;padding:1px 5px;border-radius:4px;font-size:13px}ol{padd
 </div>
 
 <div class="card" style="margin-top:14px">
-  <h2>Recent uploads</h2>
-  <table><thead><tr><th>#</th><th>When (IST)</th><th>File</th><th>Nickname</th><th>Records</th><th>New</th><th id="admh"></th></tr></thead><tbody id="ups"></tbody></table>
+  <h2>Files that added new recordings</h2>
+  <table><thead><tr><th>#</th><th>When (IST)</th><th>File</th><th>Nickname</th><th>Recordings in file</th><th>New, saved</th><th id="admh"></th></tr></thead><tbody id="ups"></tbody></table>
 </div>
 </main>
 <script>
@@ -92,7 +92,7 @@ const ist=s=>s?new Date(s).toLocaleString('en-IN',{timeZone:'Asia/Kolkata',day:'
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 async function load(){
   const s=await (await fetch('/api/stats')).json();
-  $('k1').textContent=s.unique_recordings;$('k2').textContent=s.uploads;$('k3').textContent=s.total_records_uploaded;
+  $('k1').textContent=s.unique_recordings;$('k2').textContent=s.uploads;$('k3').textContent=s.duplicates_skipped;
   const L=Object.entries(s.letters);const mx=Math.max(1,...L.map(x=>x[1]));
   const r=L.slice().sort((a,b)=>a[1]-b[1])[0];$('k4').textContent=r?`${r[0]} · ${r[1]}`:'–';
   $('bars').innerHTML=L.map(([k,v])=>`<div class="bar" style="height:${v/mx*100}%"><span>${v}</span></div>`).join('');
@@ -107,8 +107,11 @@ async function send(files){
     try{
       const res=await fetch('/api/upload',{method:'POST',body:fd});const j=await res.json();
       if(!res.ok)throw new Error(j.detail||res.statusText);
-      $('msg').className='ok';
-      $('msg').textContent=`✓ ${f.name}: ${j.records} recordings, ${j.new} new, ${j.duplicates} already in pool. Pool now ${j.pool_size}.`+(j.skipped.length?`\nSkipped: ${j.skipped.join('; ')}`:'');
+      $('msg').className=j.saved?'ok':'';
+      $('msg').textContent=(j.saved
+        ?`✓ ${f.name}: ${j.new} new recording(s) added, ${j.duplicates} duplicate(s) skipped. Pool now ${j.pool_size}.`
+        :`ℹ ${f.name}: all ${j.records} recordings are already in the pool, so nothing was saved. Thanks anyway!`)
+        +(j.skipped.length?`\nInvalid records ignored: ${j.skipped.join('; ')}`:'');
     }catch(e){$('msg').className='bad';$('msg').textContent=`✗ ${f.name}: ${e.message}`}
   }
   load();
