@@ -1,0 +1,47 @@
+name: Train Invisible Ink model
+# Trains on GitHub's runner (7 GB RAM) and uploads the model to the Render site.
+# Needs repo secrets: POOL_URL (e.g. https://invisible-ink-pool.onrender.com) and ADMIN_TOKEN.
+on:
+  schedule:
+    - cron: "17 * * * *"      # every hour; skips if the pool hasn't grown
+  workflow_dispatch:           # "Run workflow" button for a manual retrain
+    inputs:
+      force:
+        description: "Retrain even if the pool hasn't changed"
+        type: boolean
+        default: false
+concurrency: { group: train, cancel-in-progress: false }
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12", cache: pip }
+      - name: Wake the site and check whether training is needed
+        id: check
+        env: { POOL_URL: "${{ secrets.POOL_URL }}" }
+        run: |
+          for i in 1 2 3 4 5 6; do curl -sf "$POOL_URL/api/stats" -o stats.json && break; sleep 20; done
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json; s = json.load(open("stats.json"))
+          pool, trained = s["unique_recordings"], s["model"]["trained_on"]
+          print(f"pool={pool}")
+          print("needed=" + ("true" if pool >= 10 and pool != trained else "false"))
+          PY
+      - name: Install
+        if: steps.check.outputs.needed == 'true' || inputs.force
+        run: pip install -r requirements.txt
+      - name: Train and upload
+        if: steps.check.outputs.needed == 'true' || inputs.force
+        env: { POOL_URL: "${{ secrets.POOL_URL }}", ADMIN_TOKEN: "${{ secrets.ADMIN_TOKEN }}" }
+        run: |
+          curl -sf "$POOL_URL/download/pool.jsonl" -o pool.jsonl
+          N=$(grep -c . pool.jsonl)
+          START=$(date +%s)
+          python invisible_ink.py train pool.jsonl --model ink_model.pkl
+          SECS=$(( $(date +%s) - START ))
+          curl -sf --max-time 600 -X POST "$POOL_URL/api/model?token=$ADMIN_TOKEN" \
+               -F "file=@ink_model.pkl" -F "n_recordings=$N" -F "seconds=$SECS"
+          echo; echo "Uploaded model trained on $N recordings"
