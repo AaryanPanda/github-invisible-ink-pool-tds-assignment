@@ -1,9 +1,14 @@
 """Invisible Ink Pool - shared, de-duplicated training data for the TDS Invisible Ink bonus."""
-import os, io, json, hashlib, zipfile, datetime, collections
+import os
+for _k in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_k, "1")      # one maths thread: the free server has ~0.1 CPU anyway
+os.environ.setdefault("MALLOC_ARENA_MAX", "2")
+import io, json, hashlib, zipfile, datetime, collections
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
 from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse, JSONResponse
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey, LargeBinary, func
-import base64, pickle, time
+import base64, gc, pickle, threading, time
+_predict_lock = threading.Lock()   # one prediction at a time keeps memory far below 512 MB
 from typing import List
 from sqlalchemy.orm import declarative_base, sessionmaker
 
@@ -70,7 +75,9 @@ def get_model():
     if _model_cache["id"] != m.id:
         with Session() as db:
             blob = db.query(Model.blob).filter(Model.id == m.id).scalar()
+        _model_cache["model"] = None; gc.collect()
         _model_cache["model"] = pickle.loads(blob); _model_cache["id"] = m.id
+        del blob; gc.collect()
     return _model_cache["model"], m
 app = FastAPI(title="Invisible Ink Pool")
 
@@ -220,27 +227,39 @@ def delete_upload(uid: int, token: str = Query("")):
 
 @app.post("/api/predict")
 def predict(files: List[UploadFile] = File(...)):
-    """Test recordings are analysed in memory and never stored."""
-    import invisible_ink as ink
-    M, meta = get_model()
-    if M is None:
-        raise HTTPException(503, "No model yet. Upload training data and wait for training to finish.")
-    recs = []
-    for f in files[:12]:
-        raw = f.file.read(MAX_BYTES + 1)
-        if len(raw) > MAX_BYTES: raise HTTPException(413, f"{f.filename} too large")
+    """Test recordings are analysed in memory and never stored. One request at a time (memory safety)."""
+    if not _predict_lock.acquire(timeout=150):
+        raise HTTPException(503, "Server busy with other predictions. Try again in a few seconds.")
+    try:
+        import invisible_ink as ink
+        M, meta = get_model()
+        if M is None:
+            raise HTTPException(503, "No model yet. Upload training data and wait for training to finish.")
+        recs = []
+        for f in files[:12]:
+            raw = f.file.read(MAX_BYTES + 1)
+            if len(raw) > MAX_BYTES: raise HTTPException(413, f"{f.filename} too large")
+            try:
+                recs += ink.parse_text(raw.decode("utf-8", errors="replace"), f.filename or "")[:12]
+            except Exception:
+                raise HTTPException(400, f"{f.filename}: could not read JSON/JSONL")
+            del raw
+            if len(recs) >= 12: break
+        if not recs:
+            raise HTTPException(400, "No recordings with 'samples' found.")
+        out = []
+        for n, l in enumerate(recs[:12], 1):
+            r = ink.analyze(M, l, n)
+            out.append({"n": n, "file": r["file"], "id": r["id"], "length": r["length"], "guess": r["guess"],
+                        "alts": r["alts"], "png": base64.b64encode(r["png"]).decode()})
+        return {"model_trained_on": meta.n_recordings, "results": out}
+    finally:
         try:
-            recs += ink.parse_text(raw.decode("utf-8", errors="replace"), f.filename or "")
+            import matplotlib.pyplot as plt; plt.close("all")
         except Exception:
-            raise HTTPException(400, f"{f.filename}: could not read JSON/JSONL")
-    if not recs:
-        raise HTTPException(400, "No recordings with 'samples' found.")
-    out = []
-    for n, l in enumerate(recs[:12], 1):
-        r = ink.analyze(M, l, n)
-        out.append({"n": n, "file": r["file"], "id": r["id"], "length": r["length"], "guess": r["guess"],
-                    "alts": r["alts"], "png": base64.b64encode(r["png"]).decode()})
-    return {"model_trained_on": meta.n_recordings, "results": out}
+            pass
+        gc.collect()
+        _predict_lock.release()
 
 @app.post("/api/model")
 def upload_model(file: UploadFile = File(...), n_recordings: int = Form(...), seconds: int = Form(0), token: str = Query("")):
@@ -248,6 +267,8 @@ def upload_model(file: UploadFile = File(...), n_recordings: int = Form(...), se
     if not ADMIN_TOKEN or token != ADMIN_TOKEN:
         raise HTTPException(403, "Bad admin token.")
     blob = file.file.read(200 * 1024 * 1024)
+    _predict_lock.acquire()
+    _model_cache["id"] = None; _model_cache["model"] = None; gc.collect()
     try:
         import invisible_ink as ink
         M = pickle.loads(blob)
@@ -257,7 +278,10 @@ def upload_model(file: UploadFile = File(...), n_recordings: int = Form(...), se
             r = ink.analyze(M, ink.norm_rec(json.loads(body[0])), 1)   # smoke test before accepting
             assert len(r["guess"]) >= 3
     except Exception as e:
+        _predict_lock.release()
         raise HTTPException(400, f"Model failed to load/run: {e}")
+    _predict_lock.release()
+    del M; gc.collect()
     with Session() as db:
         db.add(Model(n_recordings=n_recordings, seconds=seconds, blob=blob)); db.commit()
         old = [i for (i,) in db.query(Model.id).order_by(Model.id.desc()).offset(2).all()]
