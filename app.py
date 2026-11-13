@@ -17,6 +17,7 @@ if DB_URL.startswith("postgres://"):
     DB_URL = DB_URL.replace("postgres://", "postgresql://", 1)
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
 MAX_BYTES = 15 * 1024 * 1024
+MAX_DUPLICATES = 100                    # cap for duplicate copies kept from older uploads (new uploads keep none)
 ALPHABET = set("ACEFHJKMNPRTUVWXY")
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -32,7 +33,8 @@ class Upload(Base):
     note = Column(String(200))          # optional nickname, never required
     n_records = Column(Integer)
     n_new = Column(Integer)
-    raw = Column(Text)                  # original file text
+    raw = Column(Text)                  # duplicate records kept (JSONL), capped at MAX_DUPLICATES overall
+    fps = Column(Text)                  # JSON list of fingerprints of every record in the file
 
 class Recording(Base):
     __tablename__ = "ink_recordings"
@@ -45,6 +47,20 @@ class Recording(Base):
     created = Column(DateTime, default=datetime.datetime.utcnow)
     body = Column(Text)
 
+class Meta(Base):
+    __tablename__ = "ink_meta"
+    key = Column(String(50), primary_key=True)
+    value = Column(Integer, default=0)
+
+def bump(db, key, n):
+    row = db.get(Meta, key)
+    if row is None:
+        row = Meta(key=key, value=0); db.add(row)
+    row.value = (row.value or 0) + n
+
+def meta(db, key):
+    row = db.get(Meta, key); return row.value if row else 0
+
 class Model(Base):
     __tablename__ = "ink_models"
     id = Column(Integer, primary_key=True)
@@ -54,6 +70,12 @@ class Model(Base):
     blob = Column(LargeBinary)
 
 Base.metadata.create_all(engine)
+from sqlalchemy import text as _sql
+with engine.begin() as _c:            # add the fps column to an existing table (older deploys)
+    try:
+        _c.execute(_sql("ALTER TABLE ink_uploads ADD COLUMN fps TEXT"))
+    except Exception:
+        pass
 
 # ---------- model: trained by GitHub Actions (7 GB RAM), uploaded via /api/model ----------
 _model_cache = {"id": None, "model": None}
@@ -76,10 +98,19 @@ def get_model():
         with Session() as db:
             blob = db.query(Model.blob).filter(Model.id == m.id).scalar()
         _model_cache["model"] = None; gc.collect()
-        _model_cache["model"] = pickle.loads(blob); _model_cache["id"] = m.id
+        import invisible_ink as ink
+        _model_cache["model"] = ink.load_model(blob); _model_cache["id"] = m.id
         del blob; gc.collect()
     return _model_cache["model"], m
 app = FastAPI(title="Invisible Ink Pool")
+
+@app.on_event("startup")
+def _startup():
+    for step in (compact_uploads, drop_empty_uploads):
+        try:
+            step()
+        except Exception as e:
+            print(step.__name__, "failed:", e)
 
 
 
@@ -115,6 +146,45 @@ def parse(text):
         good.append(r)
     return good, errors
 
+
+def stored_duplicates(db):
+    n = 0
+    for (raw,) in db.query(Upload.raw).filter(Upload.fps.isnot(None)).all():   # only already-compacted uploads
+        if raw: n += sum(1 for line in raw.splitlines() if line.strip())
+    return n
+
+def drop_empty_uploads():
+    """Uploads that added nothing new are not kept: count them as skipped, then remove the row."""
+    with Session() as db:
+        owners = {u for (u,) in db.query(Recording.upload_id).distinct().all()}
+        for u in db.query(Upload).all():
+            if u.id not in owners:
+                bump(db, "skipped_files", 1); bump(db, "skipped_records", u.n_records or 0)
+                db.delete(u)
+            elif (u.n_records or 0) > (u.n_new or 0) and not meta(db, f"counted_{u.id}"):
+                bump(db, "skipped_records", (u.n_records or 0) - (u.n_new or 0)); bump(db, f"counted_{u.id}", 1)
+        db.commit()
+
+def compact_uploads():
+    """One-time: replace full file copies by fingerprints + at most MAX_DUPLICATES duplicate records."""
+    with Session() as db:
+        ups = db.query(Upload).filter(Upload.fps.is_(None)).order_by(Upload.id).all()
+        if not ups: return
+        owner = {f: u for f, u in db.query(Recording.fingerprint, Recording.upload_id).all()}
+        budget = MAX_DUPLICATES - stored_duplicates(db)
+        for u in ups:
+            try:
+                good, _ = parse(u.raw) if u.raw else ([], [])
+            except Exception:
+                good = []
+            fps, dups = [], []
+            for r in good:
+                fp = fingerprint(r); fps.append(fp)
+                if owner.get(fp) != u.id and budget > 0:
+                    dups.append(json.dumps(r, separators=(",", ":"))); budget -= 1
+            u.fps = json.dumps(fps); u.raw = "\n".join(dups)
+        db.commit()
+
 @app.get("/", response_class=HTMLResponse)
 def home():
     return open(os.path.join(HERE, "static", "index.html"), encoding="utf-8").read()
@@ -134,6 +204,8 @@ def stats():
             "unique_recordings": len(recs),
             "uploads": len(ups),
             "total_records_uploaded": sum(u.n_records or 0 for u in ups),
+            "duplicates_skipped": meta(db, "skipped_records"),
+            "files_skipped": meta(db, "skipped_files"),
             "letters": {k: letters.get(k, 0) for k in sorted(ALPHABET)},
             "lengths": dict(collections.Counter(l for _, l in recs)),
             "model": _model_info(),
@@ -151,23 +223,31 @@ async def upload(file: UploadFile = File(...), note: str = Form("")):
     if not good:
         raise HTTPException(400, "No valid labelled recordings. " + "; ".join(errors[:5]))
     with Session() as db:
-        up = Upload(filename=(file.filename or "upload")[:300], note=note.strip()[:200], n_records=len(good), n_new=0, raw=text)
-        db.add(up); db.flush()
         existing = {f for (f,) in db.query(Recording.fingerprint).all()}
-        new = 0
+        fps, fresh, seen = [], [], set()
         for r in good:
-            fp = fingerprint(r)
-            if fp in existing:
-                continue
-            existing.add(fp); new += 1
+            fp = fingerprint(r); fps.append(fp)
+            if fp not in existing and fp not in seen:
+                seen.add(fp); fresh.append((fp, r))
+        dup = len(good) - len(fresh)
+        if not fresh:                      # whole file already in the pool: save nothing
+            bump(db, "skipped_files", 1); bump(db, "skipped_records", dup); db.commit()
+            total = db.query(func.count(Recording.id)).scalar()
+            return {"records": len(good), "new": 0, "duplicates": dup, "saved": False,
+                    "skipped": errors[:20], "pool_size": total}
+        up = Upload(filename=(file.filename or "upload")[:300], note=note.strip()[:200], n_records=len(good),
+                    n_new=len(fresh), raw="", fps=json.dumps(fps))
+        db.add(up); db.flush()
+        for fp, r in fresh:
             db.add(Recording(fingerprint=fp, rec_id=str(r.get("id", ""))[:100], code=r["code"],
                              length=len(r["code"]), upload_id=up.id, body=json.dumps(r, separators=(",", ":"))))
-        up.n_new = new
+        bump(db, "skipped_records", dup); bump(db, f"counted_{up.id}", 1)
         db.commit()
         total = db.query(func.count(Recording.id)).scalar()
+        new = len(fresh)
     if new:
         request_training()
-    return {"records": len(good), "new": new, "duplicates": len(good) - new, "skipped": errors[:20], "pool_size": total}
+    return {"records": len(good), "new": new, "duplicates": len(good) - new, "saved": True, "skipped": errors[:20], "pool_size": total}
 
 @app.get("/download/pool.jsonl")
 def download_pool():
@@ -184,7 +264,8 @@ def download_all():
     with Session() as db, zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr("air-ink-pool.jsonl", "".join(b + "\n" for (b,) in db.query(Recording.body).order_by(Recording.id)))
         for u in db.query(Upload).order_by(Upload.id):
-            z.writestr(f"uploads/{u.id:04d}_{os.path.basename(u.filename or 'upload')}", u.raw or "")
+            if u.raw:
+                z.writestr(f"duplicates/{u.id:04d}_{os.path.basename(u.filename or 'upload')}", u.raw)
         z.write(os.path.join(HERE, "invisible_ink.py"), "invisible_ink.py")
     buf.seek(0)
     return StreamingResponse(buf, media_type="application/zip",
@@ -219,23 +300,19 @@ def delete_upload(uid: int, token: str = Query("")):
     if not ADMIN_TOKEN or token != ADMIN_TOKEN:
         raise HTTPException(403, "Bad admin token.")
     with Session() as db:
-        db.query(Recording).filter(Recording.upload_id == uid).delete()
+        others = {}
+        for oid, fps in db.query(Upload.id, Upload.fps).filter(Upload.id != uid).order_by(Upload.id):
+            for fp in json.loads(fps or "[]"):
+                others.setdefault(fp, oid)
+        kept = removed = 0
+        for rec in db.query(Recording).filter(Recording.upload_id == uid).all():
+            if rec.fingerprint in others:
+                rec.upload_id = others[rec.fingerprint]; kept += 1   # someone else uploaded it too
+            else:
+                db.delete(rec); removed += 1
         n = db.query(Upload).filter(Upload.id == uid).delete()
         db.commit()
-        # re-add recordings that other uploads also contained
-        existing = {f for (f,) in db.query(Recording.fingerprint).all()}
-        restored = 0
-        for u in db.query(Upload).order_by(Upload.id):
-            good, _ = parse(u.raw or "")
-            for r in good:
-                fp = fingerprint(r)
-                if fp not in existing:
-                    existing.add(fp); restored += 1
-                    db.add(Recording(fingerprint=fp, rec_id=str(r.get("id", ""))[:100], code=r["code"],
-                                     length=len(r["code"]), upload_id=u.id, body=json.dumps(r, separators=(",", ":"))))
-        db.commit()
-    request_training()
-    return {"deleted": n, "restored_from_other_uploads": restored}
+    return {"deleted": n, "recordings_removed": removed, "kept_because_others_uploaded_them": kept}
 
 @app.post("/api/predict")
 def predict(files: List[UploadFile] = File(...)):
@@ -283,7 +360,7 @@ def upload_model(file: UploadFile = File(...), n_recordings: int = Form(...), se
     _model_cache["id"] = None; _model_cache["model"] = None; gc.collect()
     try:
         import invisible_ink as ink
-        M = pickle.loads(blob)
+        M = ink.load_model(blob)
         with Session() as db:
             body = db.query(Recording.body).first()
         if body:
