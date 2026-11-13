@@ -12,3 +12,9 @@ services:
         generateValue: true
       - key: PYTHON_VERSION
         value: 3.12.7
+      - key: MALLOC_ARENA_MAX     # fewer memory pools per thread: ~25% less RAM
+        value: "2"
+      - key: OMP_NUM_THREADS
+        value: "1"
+      - key: OPENBLAS_NUM_THREADS
+        value: "1"
