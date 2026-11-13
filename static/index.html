@@ -81,12 +81,13 @@ code{background:#f0efe9;padding:1px 5px;border-radius:4px;font-size:13px}ol{padd
 
 <div class="card" style="margin-top:14px">
   <h2>Recent uploads</h2>
-  <table><thead><tr><th>#</th><th>When (UTC)</th><th>File</th><th>Nickname</th><th>Records</th><th>New</th><th id="admh"></th></tr></thead><tbody id="ups"></tbody></table>
+  <table><thead><tr><th>#</th><th>When (IST)</th><th>File</th><th>Nickname</th><th>Records</th><th>New</th><th id="admh"></th></tr></thead><tbody id="ups"></tbody></table>
 </div>
 </main>
 <script>
 const admin=new URLSearchParams(location.search).has('admin');
 const $=id=>document.getElementById(id);
+const ist=s=>s?new Date(s).toLocaleString('en-IN',{timeZone:'Asia/Kolkata',day:'numeric',month:'short',hour:'numeric',minute:'2-digit',hour12:true})+' IST':'';
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 async function load(){
   const s=await (await fetch('/api/stats')).json();
@@ -96,7 +97,7 @@ async function load(){
   $('bars').innerHTML=L.map(([k,v])=>`<div class="bar" style="height:${v/mx*100}%"><span>${v}</span></div>`).join('');
   $('lbls').innerHTML=L.map(([k])=>`<div>${k}</div>`).join('');
   mstatus(s.model);if(admin)$('admh').textContent='Admin';
-  $('ups').innerHTML=s.recent.map(u=>`<tr><td>${u.id}</td><td>${esc(u.when.replace('T',' '))}</td><td>${esc(u.file)}</td><td>${esc(u.note)}</td><td>${u.records}</td><td>${u.new}</td>${admin?`<td><button class="del" onclick="del(${u.id})">Delete</button></td>`:''}</tr>`).join('')||'<tr><td colspan="6">No uploads yet. Be the first!</td></tr>';
+  $('ups').innerHTML=s.recent.map(u=>`<tr><td>${u.id}</td><td>${esc(ist(u.when))}</td><td>${esc(u.file)}</td><td>${esc(u.note)}</td><td>${u.records}</td><td>${u.new}</td>${admin?`<td><button class="del" onclick="del(${u.id})">Delete</button></td>`:''}</tr>`).join('')||'<tr><td colspan="6">No uploads yet. Be the first!</td></tr>';
 }
 async function send(files){
   for(const f of files){
@@ -121,7 +122,7 @@ const d=$('drop');d.onclick=()=>$('file').click();$('file').onchange=e=>send(e.t
 ['dragleave','drop'].forEach(ev=>d.addEventListener(ev,e=>{e.preventDefault();d.classList.remove('hover')}));
 d.addEventListener('drop',e=>send(e.dataTransfer.files));
 function mstatus(m){
-  let t=m.trained_on?`Model trained on ${m.trained_on} recordings (${m.when.replace('T',' ')} UTC).`:'No model yet. The first one arrives within about an hour of the first upload.';
+  let t=m.trained_on?`Model trained on ${m.trained_on} recordings (${ist(m.when)}).`:'No model yet. The first one arrives within about an hour of the first upload.';
   if(m.trained_on && m.pool>m.trained_on)t+=` The pool now has ${m.pool}; the model updates automatically within about an hour.`;
   $('mstat').textContent=t;
 }
