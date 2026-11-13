@@ -21,7 +21,7 @@ from sklearn.pipeline import make_pipeline
 from sklearn.svm import SVC
 
 ALPHA = 'ACEFHJKMNPRTUVWXY'; JUNK = len(ALPHA)
-FEAT_VERSION = 2
+FEAT_VERSION = 3
 SEED = 0
 rng = np.random.default_rng(SEED)
 
@@ -78,8 +78,12 @@ def feats(l,fv=2):
         after=np.array([(und>ti).sum() for ti in t])
     else: nxt=prv=np.full(n,1e6); after=np.zeros(n)
     F['tnext_undo']=np.minimum(nxt,6e4); F['tprev_undo']=np.minimum(prv,6e4); F['n_undo_after']=after
-    F['n_undo_total']=np.full(n,len(und)); F['dur']=np.full(n,t[-1]-t[0])
+    if fv<=2:   # older models used whole-recording inputs (they invited shortcuts and were dropped in v3)
+        F['n_undo_total']=np.full(n,len(und)); F['dur']=np.full(n,t[-1]-t[0])
     if fv==1: F["length"]=np.full(n,float(l.get('length') or 4))   # old models only; carried no signal
+    if fv>=3:   # a 'clear' erases everything before it
+        cl=[c['t'] for c in l['controls'] if c['type']=='clear']; lc=max(cl) if cl else -1e18
+        F['before_last_clear']=(t<lc).astype(float); F['since_last_clear']=np.minimum(np.maximum(t-lc,0),6e4)
     names=list(F); return np.c_[[F[k] for k in names]].T.astype(float), names
 
 
@@ -322,11 +326,11 @@ def decode(l,w,clf,k=None,B=30,topn=3,relax=False):
     b=max(res,key=lambda r:r[0])
     alts=[''.join(ALPHA[i] for i in np.argsort(-lp)[:topn]) for lp in b[2]]
     return b[1],alts,b[3]
-def analyze(M,l,n=1):
-    """Predict one recording. Returns dict with guess, alts and a PNG (bytes)."""
+def analyze(M,l,n=1,length=None):
+    """Predict one recording. length: number of letters if known (counted by a person or given in the file)."""
     import matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt
     from matplotlib.collections import LineCollection
-    w=ink(M,l); k=l.get('length')
+    w=ink(M,l); k=length if length in (3,4,5) else l.get('length')
     guess,alts,cuts=decode(l,w,M['clf'],k=k)
     s=np.array(l['samples'],float); x=s[:,2]; y=s[:,1]
     seg=np.stack([np.c_[x[:-1],y[:-1]],np.c_[x[1:],y[1:]]],1); ww=np.minimum(w[:-1],w[1:]); on=ww>0.15
@@ -344,11 +348,12 @@ def analyze(M,l,n=1):
     axs[1].set_title('same ink coloured by time: purple = early, yellow = late',fontsize=9)
     plt.tight_layout(); buf=io.BytesIO(); plt.savefig(buf,format='png',dpi=80); plt.close(fig)
     return {'n':n,'file':l.get('_file',''),'id':l.get('id',''),'length':k,'guess':guess,'alts':alts,'png':buf.getvalue()}
-def predict(model,paths,outdir):
+def predict(model,paths,outdir,lengths=None):
+    """lengths: optional {drawing number: letters}, e.g. {3: 5} if you can count 5 letters in drawing 3."""
     M=load_model(model) if isinstance(model,str) else model
-    os.makedirs(outdir,exist_ok=True); lines=[]; results=[]
+    os.makedirs(outdir,exist_ok=True); lines=[]; results=[]; lengths=lengths or {}
     for n,l in enumerate(read_any(paths),1):
-        r=analyze(M,l,n); f=os.path.join(outdir,f'drawing_{n}.png'); open(f,'wb').write(r['png'])
+        r=analyze(M,l,n,lengths.get(n)); f=os.path.join(outdir,f'drawing_{n}.png'); open(f,'wb').write(r['png'])
         line=f"Drawing {n}: auto guess {r['guess']}   top-3 per letter: {' '.join(r['alts'])}   -> {f}"
         print(line); lines.append(line); r['path']=f; results.append(r)
     open(os.path.join(outdir,'guesses.txt'),'w').write('\n'.join(lines)+'\n')
