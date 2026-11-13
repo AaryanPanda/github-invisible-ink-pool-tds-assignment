@@ -323,7 +323,7 @@ def delete_upload(uid: int, request: Request, token: str = Query("")):
     return {"deleted": n, "recordings_removed": removed, "kept_because_others_uploaded_them": kept}
 
 @app.post("/api/predict")
-def predict(files: List[UploadFile] = File(...)):
+def predict(files: List[UploadFile] = File(...), lengths: str = Form(""), start: int = Form(1)):
     """Test recordings are analysed in memory and never stored. One request at a time (memory safety)."""
     if not _predict_lock.acquire(timeout=150):
         raise HTTPException(503, "Server busy with other predictions. Try again in a few seconds.")
@@ -345,8 +345,13 @@ def predict(files: List[UploadFile] = File(...)):
         if not recs:
             raise HTTPException(400, "No recordings with 'samples' found.")
         out = []
-        for n, l in enumerate(recs[:12], 1):
-            r = ink.analyze(M, l, n)
+        try:
+            ks = json.loads(lengths) if lengths else []
+        except Exception:
+            ks = []
+        for n, l in enumerate(recs[:12], start):
+            k = ks[n - start] if n - start < len(ks) else None
+            r = ink.analyze(M, l, n, k if k in (3, 4, 5) else None)
             out.append({"n": n, "file": r["file"], "id": r["id"], "length": r["length"], "guess": r["guess"],
                         "alts": r["alts"], "png": base64.b64encode(r["png"]).decode()})
         return {"model_trained_on": meta.n_recordings, "results": out}
