@@ -1,15 +1,31 @@
 """Invisible Ink predictor (IITM TDS bonus).
-Usage:
-  pip install numpy scipy scikit-learn scikit-image matplotlib
-  python invisible_ink.py train air-ink-training-60.jsonl [more_labelled.jsonl ...]
-  python invisible_ink.py predict test_files/*.json --out out
-Outputs out/drawing_N.png (predicted ink + auto guess) and out/guesses.txt
-"""
 
-# ===== common.py =====
-import json, numpy as np
-def load(path):
-    return [json.loads(x) for x in open(path) if x.strip()]
+  python invisible_ink.py train pool.jsonl [more_labelled.jsonl ...] --model ink_model.pkl
+  python invisible_ink.py predict test/*.json --model ink_model.pkl --out out
+
+Pipeline
+  1. Pen-down ("ink") detector: two-stage gradient boosting on per-sample motion features
+     (speed, turning, straightness, timing, undo/clear events).
+  2. Letter reader: HOG features + SVC on letter images (synthetic template letters + real letters,
+     real ones weighted 3x), trained on out-of-fold ink so it sees realistic, imperfect ink.
+  3. Decoder: dynamic programming over left-to-right letter cuts (length 3-5, or the given length).
+Outputs drawing_N.png (predicted ink + auto guess) and guesses.txt
+"""
+import json, os, io, glob, gzip, pickle, argparse, itertools
+import numpy as np
+from scipy.ndimage import gaussian_filter
+from skimage.feature import hog
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import make_pipeline
+from sklearn.svm import SVC
+
+ALPHA = 'ACEFHJKMNPRTUVWXY'; JUNK = len(ALPHA)
+FEAT_VERSION = 2
+SEED = 0
+rng = np.random.default_rng(SEED)
+
+# ---------------- labels: which pen-down samples survive undo/clear ----------------
 def runs(p):
     d=np.diff(np.r_[0,p.astype(int),0]); return list(zip(np.where(d==1)[0],np.where(d==-1)[0]))
 def kept_runs(l):
@@ -23,7 +39,8 @@ def kept_runs(l):
         elif ty=='clear': stack=[]
     return stack
 
-# ===== feats.py =====
+
+# ---------------- per-sample motion features ----------------
 def target(l):
     s=np.array(l['samples']); y=np.zeros(len(s))
     for a,b in kept_runs(l): y[a:b]=1
@@ -34,7 +51,7 @@ def roll(a,w,f=np.mean):
     win=np.lib.stride_tricks.sliding_window_view(p,2*w+1)
     g={np.mean:np.nanmean,np.std:np.nanstd,np.max:np.nanmax,np.min:np.nanmin}.get(f,f)
     return g(win,axis=1)
-def feats(l):
+def feats(l,fv=2):
     s=np.array(l['samples'],float); t=s[:,0]; x=s[:,2]; y=s[:,1]; n=len(s)
     # normalise position by robust bbox
     x0,x1=np.percentile(x,[2,98]); y0,y1=np.percentile(y,[2,98]); sc=max(x1-x0,y1-y0,1)
@@ -61,11 +78,12 @@ def feats(l):
         after=np.array([(und>ti).sum() for ti in t])
     else: nxt=prv=np.full(n,1e6); after=np.zeros(n)
     F['tnext_undo']=np.minimum(nxt,6e4); F['tprev_undo']=np.minimum(prv,6e4); F['n_undo_after']=after
-    F['n_undo_total']=np.full(n,len(und)); F['dur']=np.full(n,t[-1]-t[0]); F['length']=np.full(n,l.get('length',4))
-    names=list(F); return np.c_[[F[k] for k in names]].T, names
+    F['n_undo_total']=np.full(n,len(und)); F['dur']=np.full(n,t[-1]-t[0])
+    if fv==1: F["length"]=np.full(n,float(l.get('length') or 4))   # old models only; carried no signal
+    names=list(F); return np.c_[[F[k] for k in names]].T.astype(float), names
 
-# ===== letters.py =====
-from scipy.ndimage import gaussian_filter
+
+# ---------------- letter images ----------------
 R=24
 def word_frame(l,w):
     s=np.array(l['samples'],float); x=s[:,2]; y=s[:,1]
@@ -109,13 +127,7 @@ def true_cuts(l):
     sp=best[1]
     return [(sp[i][1]+sp[i+1][0])/2 for i in range(k-1)], sp
 
-# ===== pipeline.py =====
-from sklearn.ensemble import HistGradientBoostingClassifier
-from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import StandardScaler
-from sklearn.pipeline import make_pipeline
-ALPHA='ACEFHJKMNPRTUVWXY'; JUNK=len(ALPHA)
-rng=np.random.default_rng(0)
+
 def letter_examples(l,w,jit=3):
     r=true_cuts(l)
     if r is None: return [],[]
@@ -136,46 +148,10 @@ def letter_examples(l,w,jit=3):
             F.append(seg_feat(x,y,w,a,edges[i+2],y0,y1,X0,X1)); Y.append(JUNK)
             F.append(seg_feat(x,y,w,mid,(edges[i+1]+edges[i+2])/2,y0,y1,X0,X1)); Y.append(JUNK)
     return F,Y
-def train_letters(recs,weights):
-    F=[];Y=[]
-    for l,w in zip(recs,weights):
-        f,y=letter_examples(l,w); F+=f;Y+=y
-    m=make_pipeline(StandardScaler(),LogisticRegression(C=0.05,max_iter=3000))
-    m.fit(np.array(F),np.array(Y)); return m
-def decode(l,w,clf,k=None,B=36):
-    x,y,(X0,X1,y0,y1)=word_frame(l,w); H=y1-y0; span=X1-X0
-    edges=np.linspace(X0-0.03*span,X1+0.03*span,B+1)
-    ks=[k] if k else [3,4,5]
-    # precompute segment log-probs
-    cache={}
-    def sc(i,j):
-        if (i,j) not in cache:
-            wd=edges[j]-edges[i]
-            if wd<0.25*H or wd>1.6*H: cache[(i,j)]=(-1e9,0)
-            else:
-                p=clf.predict_proba(seg_feat(x,y,w,edges[i],edges[j],y0,y1,X0,X1)[None])[0]
-                lp=np.log(p[:JUNK]+1e-9); c=int(lp.argmax()); cache[(i,j)]=(lp[c],c)
-        return cache[(i,j)]
-    best=None
-    for kk in ks:
-        # dp[n][j]: best score covering edges[0..j] with n letters
-        dp={(0,0):(0,[])}
-        for n in range(1,kk+1):
-            for j in range(1,B+1):
-                cand=[]
-                for i in range(0,j):
-                    if (n-1,i) in dp:
-                        s,c=sc(i,j); cand.append((dp[(n-1,i)][0]+s,dp[(n-1,i)][1]+[c]))
-                if cand: dp[(n,j)]=max(cand,key=lambda t:t[0])
-        if (kk,B) in dp:
-            s,cs=dp[(kk,B)]; s_norm=s/kk
-            if best is None or s_norm>best[0]: best=(s_norm,''.join(ALPHA[c] for c in cs))
-    return best[1] if best else 'A'*(k or 4)
 def pos_score(g,t):
     return sum(a==b for a,b in zip(g,t))/len(t)
 
-# ===== synth.py =====
-from skimage.feature import hog
+# ---------------- synthetic template letters ----------------
 def arc(cx,cy,rx,ry,a0,a1,n=12):
     a=np.linspace(a0,a1,n); return list(zip(cx+rx*np.cos(a),cy+ry*np.sin(a)))
 P_bowl=[(0,0),(0.6,0)]+arc(0.6,0.23,0.35,0.23,-np.pi/2,np.pi/2,8)+[(0,0.46)]
@@ -192,16 +168,13 @@ T={
 'P':[[[(0,1),(0,0)],P_bowl],[[(0,1)]+P_bowl]],
 'R':[[[(0,1),(0,0)],P_bowl+[(0.9,1)]],[[(0,1)]+P_bowl,[(0.3,0.46),(0.9,1)]]],
 'T':[[[(0,0),(1,0)],[(0.5,0),(0.5,1)]]],
-'U':[[[(0,0),(0,0.6)]+arc(0.5,0.6,0.5,0.4,np.pi,0,10)[::-1][::-1]+[(1,0)]]],
+'U':[[[(0,0),(0,0.6)]+arc(0.5,0.6,0.5,0.4,np.pi,0,10)+[(1,0)]],
+     [[(0,0),(0,0.75)]+arc(0.5,0.75,0.5,0.25,np.pi,0,8)+[(1,0)]]],
 'V':[[[(0,0),(0.5,1),(1,0)]]],
 'W':[[[(0,0),(0.25,1),(0.5,0.3),(0.75,1),(1,0)]]],
 'X':[[[(0,0),(1,1)],[(1,0),(0,1)]]],
 'Y':[[[(0,0),(0.5,0.5),(1,0)],[(0.5,0.5),(0.5,1)]],[[(0,0),(0.5,0.5)],[(1,0),(0.5,0.5),(0.5,1)]],[[(0,0),(0.5,0.5)],[(1,0),(0,1)]]],
 }
-# fix U arc direction: from left-bottom around to right
-T['U']=[[[(0,0),(0,0.6)]+arc(0.5,0.6,0.5,0.4,np.pi,0,10)+[(1,0)]],[[(0,0),(0.5,1),(1,0)]],]
-T['U'][1]=[[(0,0),(0,0.75)]+arc(0.5,0.75,0.5,0.25,np.pi,0,8)+[(1,0)]]
-T['U']=[[T['U'][0][0]],[T['U'][1]]] if isinstance(T['U'][1][0],tuple) else T['U']
 rng2=np.random.default_rng(1)
 def synth(ch):
     strokes=T[ch][rng2.integers(len(T[ch]))]
@@ -240,13 +213,17 @@ def synth_set(n=150):
         for _ in range(n): F.append(synth(ch)); Y.append(i)
     return np.array(F),np.array(Y)
 
-# ===== main: train / predict =====
-import argparse, glob, os, pickle, io
-from sklearn.svm import SVC
+
+# ---------------- input handling ----------------
 def norm_rec(l):
-    """make test files look like training files"""
-    s=[list(r)+[0]*(4-len(r)) if len(r)<4 else list(r) for r in l['samples']]
-    l=dict(l); l['samples']=s; l.setdefault('controls',[]); l.setdefault('length',None)
+    """Make any recording look like a training file. Remembers whether the file had controls."""
+    l=dict(l)
+    l['_has_controls']=isinstance(l.get('controls'),list)
+    l['samples']=[(list(r)+[0]*(4-len(r)))[:4] for r in l['samples']]
+    for r in l['samples']:
+        if r[3] is None: r[3]=0
+    if not isinstance(l.get('controls'),list): l['controls']=[]
+    l.setdefault('length',None)
     return l
 def parse_text(txt,name=''):
     txt=txt.strip().lstrip('\ufeff')
@@ -256,67 +233,70 @@ def parse_text(txt,name=''):
         objs=[json.loads(x) for x in txt.splitlines() if x.strip()]
     out=[]
     for o in objs:
-        if isinstance(o,dict) and 'samples' in o: o['_file']=name; out.append(norm_rec(o))
+        if isinstance(o,dict) and isinstance(o.get('samples'),list) and len(o['samples'])>=5:
+            o['_file']=name; out.append(norm_rec(o))
     return out
 def read_any(paths):
     out=[]
     for p in paths:
-        txt=open(p,encoding='utf-8').read().strip()
-        try:
-            o=json.loads(txt); objs=o if isinstance(o,list) else [o]
-        except json.JSONDecodeError:
-            objs=[json.loads(x) for x in txt.splitlines() if x.strip()]
-        for o in objs:
-            if 'samples' in o: o['_file']=os.path.basename(p); out.append(norm_rec(o))
+        out+=parse_text(open(p,encoding='utf-8').read(),os.path.basename(p))
     return out
-def stackf(p):
-    return np.c_[[roll(p,w) for w in (1,3,6,12)]+[np.roll(p,k) for k in (-4,-2,2,4)]+[roll(p,6,np.max),roll(p,6,np.min)]].T
-def hgb(): return HistGradientBoostingClassifier(max_iter=300,learning_rate=0.05,l2_regularization=1.0)
 def dedup(L):
     seen=set(); out=[]
     for l in L:
-        key=tuple(round(v,2) for r in l['samples'][:60] for v in r[1:3])
+        key=(l.get('code'),tuple(round(v,1) for r in l['samples'] for v in r[1:3]))
         if key not in seen: seen.add(key); out.append(l)
     return out
+
+# ---------------- training ----------------
+def stackf(p):
+    return np.c_[[roll(p,w) for w in (1,3,6,12)]+[np.roll(p,k) for k in (-4,-2,2,4)]+[roll(p,6,np.max),roll(p,6,np.min)]].T
+def hgb(n=300): return HistGradientBoostingClassifier(max_iter=n,learning_rate=0.05,l2_regularization=1.0,random_state=SEED)
+def train_ink(L, fv=FEAT_VERSION, K=4):
+    """Two-stage ink detector. Returns (m1, m2, oof): oof = out-of-fold stage-1 ink per recording,
+    used to train the letter reader (softer ink than stage 2; tested to give better letter accuracy)."""
+    Xs=[feats(l,fv)[0] for l in L]; Ys=[target(l) for l in L]; idx=np.arange(len(L)); fold=idx%K
+    oof=[None]*len(L)
+    for g in range(K):
+        m=hgb().fit(np.vstack([Xs[i] for i in idx[fold!=g]]),np.concatenate([Ys[i] for i in idx[fold!=g]]))
+        for i in idx[fold==g]: oof[i]=m.predict_proba(Xs[i])[:,1]
+        del m
+    m1=hgb().fit(np.vstack(Xs),np.concatenate(Ys))
+    m2=hgb(200).fit(np.vstack([np.c_[Xs[i],stackf(oof[i])] for i in idx]),np.concatenate(Ys))
+    return m1,m2,oof
+def train(paths, out):
+    L=dedup([l for l in read_any(paths) if l.get('code')])
+    print(f'training on {len(L)} unique labelled recordings')
+    m1,m2,oof=train_ink(L)
+    print('ink model done; building letter classifier (synthetic + real)...')
+    SF,SY=synth_set(200); Xl=[hogf(SF)]; Yl=[SY]; Wl=[np.ones(len(SY))]
+    for l,w in zip(L,oof):
+        for ww in (w,target(l)):
+            ff,yy=letter_examples(l,ww,jit=2)
+            if not ff: continue
+            ff=np.array(ff);yy=np.array(yy);m=yy!=JUNK
+            Xl.append(hogf(ff[m])); Yl.append(yy[m]); Wl.append(np.full(m.sum(),3.0))   # real letters count 3x
+    clf=make_pipeline(StandardScaler(),SVC(C=2,gamma='scale',probability=True,random_state=SEED)).fit(
+        np.vstack(Xl),np.concatenate(Yl),svc__sample_weight=np.concatenate(Wl))
+    M={'v':FEAT_VERSION,'m1':m1,'m2':m2,'clf':clf,'n':len(L)}
+    with gzip.open(out,'wb',compresslevel=6) as f: pickle.dump(M,f,protocol=5)
+    print('saved',out)
+
+# ---------------- prediction ----------------
 class SoftSVC:
-    """SVC + scaler with softmax over one-vs-rest decision scores (no costly probability calibration)."""
+    """Kept only so model files made by an earlier experimental version still load."""
     def __init__(self,sc,svc): self.sc=sc; self.svc=svc
     def predict_proba(self,X):
         d=self.svc.decision_function(self.sc.transform(np.asarray(X,np.float32)))
         full=np.full((len(d),JUNK+1),-1e3); full[:,self.svc.classes_]=d*3
         e=np.exp(full-full.max(1,keepdims=True)); return e/e.sum(1,keepdims=True)
-def train(paths, out):
-    L=dedup([l for l in read_any(paths) if 'code' in l])
-    print(f'training on {len(L)} unique labelled recordings')
-    Xs=[feats(l)[0] for l in L]; Ys=[target(l) for l in L]; idx=np.arange(len(L))
-    inner=[None]*len(L)
-    for g in range(4):
-        m=hgb().fit(np.vstack([Xs[i] for i in idx if i%4!=g]),np.concatenate([Ys[i] for i in idx if i%4!=g]))
-        for i in idx[idx%4==g]: inner[i]=m.predict_proba(Xs[i])[:,1]
-    m1=hgb().fit(np.vstack(Xs),np.concatenate(Ys))
-    m2=HistGradientBoostingClassifier(max_iter=200,learning_rate=0.05,l2_regularization=1.0).fit(
-        np.vstack([np.c_[Xs[i],stackf(inner[i])] for i in idx]),np.concatenate(Ys))
-    print('ink model done; building letter classifier (synthetic + real)...')
-    SF,SY=synth_set(200); Xl=[hogf(SF)]; Yl=[SY]; Wl=[np.ones(len(SY))]
-    for l,w in zip(L,inner):
-        for ww in (w,target(l)):
-            ff,yy=letter_examples(l,ww,jit=2)
-            if not ff: continue
-            ff=np.array(ff);yy=np.array(yy);m=yy!=JUNK
-            Xl.append(hogf(ff[m])); Yl.append(yy[m]); Wl.append(np.full(m.sum(),3.0))   # weight 3 instead of 3 copies
-    clf=make_pipeline(StandardScaler(),SVC(C=2,gamma='scale',probability=True)).fit(
-        np.vstack(Xl),np.concatenate(Yl),svc__sample_weight=np.concatenate(Wl))
-    import gzip
-    with gzip.open(out,'wb',compresslevel=6) as f: pickle.dump({'m1':m1,'m2':m2,'clf':clf},f,protocol=5)
-    print('saved',out)
 def load_model(src):
     """Load a model from a path or bytes; accepts gzip-compressed or plain pickles."""
-    import gzip
     data=open(src,'rb').read() if isinstance(src,str) else src
     if data[:2]==b'\x1f\x8b': data=gzip.decompress(data)
     return pickle.loads(data)
 def ink(M,l):
-    X=feats(l)[0]; p=M['m1'].predict_proba(X)[:,1]
+    X=feats(l,M.get('v',1))[0]; p=M['m1'].predict_proba(X)[:,1]
     return M['m2'].predict_proba(np.c_[X,stackf(p)])[:,1]
 def decode(l,w,clf,k=None,B=30,topn=3,relax=False):
     x,y,(X0,X1,y0,y1)=word_frame(l,w); H=y1-y0; span=X1-X0
@@ -345,20 +325,21 @@ def decode(l,w,clf,k=None,B=30,topn=3,relax=False):
 def analyze(M,l,n=1):
     """Predict one recording. Returns dict with guess, alts and a PNG (bytes)."""
     import matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt
+    from matplotlib.collections import LineCollection
     w=ink(M,l); k=l.get('length')
     guess,alts,cuts=decode(l,w,M['clf'],k=k)
     s=np.array(l['samples'],float); x=s[:,2]; y=s[:,1]
+    seg=np.stack([np.c_[x[:-1],y[:-1]],np.c_[x[1:],y[1:]]],1); ww=np.minimum(w[:-1],w[1:]); on=ww>0.15
     fig,axs=plt.subplots(2,1,figsize=(9,8))
     for ax,mode in zip(axs,('ink','time')):
         ax.plot(x,y,color='0.88',lw=0.7)
-        for i in range(len(x)-1):
-            ww=min(w[i],w[i+1])
-            if ww>0.15:
-                col='k' if mode=='ink' else plt.cm.viridis(i/len(x))
-                ax.plot(x[i:i+2],y[i:i+2],color=col,lw=0.5+3*ww,alpha=float(min(1,0.2+ww)),solid_capstyle='round')
+        if on.any():
+            if mode=='ink': cols=np.zeros((on.sum(),4)); cols[:,3]=np.minimum(1,0.2+ww[on])
+            else: cols=plt.cm.viridis(np.where(on)[0]/len(x)); cols[:,3]=np.minimum(1,0.2+ww[on])
+            ax.add_collection(LineCollection(seg[on],colors=cols,linewidths=0.5+3*ww[on],capstyle='round'))
         ax.invert_yaxis(); ax.set_aspect('equal'); ax.set_xticks([]); ax.set_yticks([])
     for c in cuts: axs[0].axvline(c,color='r',ls=':',lw=1)
-    truth=f"   (true: {l['code']})" if 'code' in l else ''
+    truth=f"   (true: {l['code']})" if l.get('code') else ''
     axs[0].set_title(f"#{n} {l.get('_file','')} {l.get('id','')} | length={k or '?'} | auto guess: {guess}{truth}",fontsize=10)
     axs[1].set_title('same ink coloured by time: purple = early, yellow = late',fontsize=9)
     plt.tight_layout(); buf=io.BytesIO(); plt.savefig(buf,format='png',dpi=80); plt.close(fig)
@@ -372,6 +353,7 @@ def predict(model,paths,outdir):
         print(line); lines.append(line); r['path']=f; results.append(r)
     open(os.path.join(outdir,'guesses.txt'),'w').write('\n'.join(lines)+'\n')
     return results
+
 if __name__=='__main__':
     ap=argparse.ArgumentParser(description='Invisible Ink predictor')
     sub=ap.add_subparsers(dest='cmd',required=True)
@@ -379,5 +361,6 @@ if __name__=='__main__':
     p=sub.add_parser('predict'); p.add_argument('files',nargs='+'); p.add_argument('--model',default='ink_model.pkl'); p.add_argument('--out',default='out')
     a=ap.parse_args()
     import invisible_ink as _mod   # run via the module name so pickled classes load anywhere
-    if a.cmd=='train': _mod.train(sum([glob.glob(f) for f in a.files],[]),a.model)
-    else: _mod.predict(a.model,sum([glob.glob(f) for f in a.files],[]),a.out)
+    files=sum([sorted(glob.glob(f)) for f in a.files],[])
+    if a.cmd=='train': _mod.train(files,a.model)
+    else: _mod.predict(a.model,files,a.out)
