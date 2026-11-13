@@ -4,7 +4,7 @@ for _k in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
     os.environ.setdefault(_k, "1")      # one maths thread: the free server has ~0.1 CPU anyway
 os.environ.setdefault("MALLOC_ARENA_MAX", "2")
 import io, json, hashlib, zipfile, datetime, collections
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse, JSONResponse
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey, LargeBinary, func
 import base64, gc, pickle, threading, time
@@ -197,6 +197,18 @@ def download_model():
     if not blob: raise HTTPException(404, "No model trained yet.")
     return StreamingResponse(io.BytesIO(blob), media_type="application/octet-stream",
                              headers={"Content-Disposition": "attachment; filename=ink_model.pkl"})
+
+@app.get("/download/invisible_ink.ipynb")
+def download_notebook(request: Request):
+    """Colab notebook with POOL_URL pre-filled to this site."""
+    nb = json.load(open(os.path.join(HERE, "invisible_ink.ipynb"), encoding="utf-8"))
+    base = str(request.base_url).rstrip("/").replace("http://", "https://") if "onrender.com" in str(request.base_url) else str(request.base_url).rstrip("/")
+    for c in nb["cells"]:
+        src = "".join(c["source"]) if isinstance(c["source"], list) else c["source"]
+        if src.startswith("# 1. Settings"):
+            c["source"] = src.replace('POOL_URL = ""', f'POOL_URL = "{base}"')
+    return StreamingResponse(io.BytesIO(json.dumps(nb, indent=1).encode()), media_type="application/x-ipynb+json",
+                             headers={"Content-Disposition": "attachment; filename=invisible_ink.ipynb"})
 
 @app.get("/download/invisible_ink.py")
 def download_script():
