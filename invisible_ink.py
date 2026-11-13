@@ -297,14 +297,24 @@ def train(paths, out):
     m2=HistGradientBoostingClassifier(max_iter=200,learning_rate=0.05,l2_regularization=1.0).fit(
         np.vstack([np.c_[Xs[i],stackf(inner[i])] for i in idx]),np.concatenate(Ys))
     print('ink model done; building letter classifier (synthetic + real)...')
-    SF,SY=synth_set(200); Xl=[hogf(SF)]; Yl=[SY]
+    SF,SY=synth_set(200); Xl=[hogf(SF)]; Yl=[SY]; Wl=[np.ones(len(SY))]
     for l,w in zip(L,inner):
         for ww in (w,target(l)):
             ff,yy=letter_examples(l,ww,jit=2)
             if not ff: continue
-            ff=np.array(ff);yy=np.array(yy);m=yy!=JUNK; Xl+=[hogf(ff[m])]*3; Yl+=[yy[m]]*3
-    clf=make_pipeline(StandardScaler(),SVC(C=2,gamma='scale',probability=True)).fit(np.vstack(Xl),np.concatenate(Yl))
-    pickle.dump({'m1':m1,'m2':m2,'clf':clf},open(out,'wb')); print('saved',out)
+            ff=np.array(ff);yy=np.array(yy);m=yy!=JUNK
+            Xl.append(hogf(ff[m])); Yl.append(yy[m]); Wl.append(np.full(m.sum(),3.0))   # weight 3 instead of 3 copies
+    clf=make_pipeline(StandardScaler(),SVC(C=2,gamma='scale',probability=True)).fit(
+        np.vstack(Xl),np.concatenate(Yl),svc__sample_weight=np.concatenate(Wl))
+    import gzip
+    with gzip.open(out,'wb',compresslevel=6) as f: pickle.dump({'m1':m1,'m2':m2,'clf':clf},f,protocol=5)
+    print('saved',out)
+def load_model(src):
+    """Load a model from a path or bytes; accepts gzip-compressed or plain pickles."""
+    import gzip
+    data=open(src,'rb').read() if isinstance(src,str) else src
+    if data[:2]==b'\x1f\x8b': data=gzip.decompress(data)
+    return pickle.loads(data)
 def ink(M,l):
     X=feats(l)[0]; p=M['m1'].predict_proba(X)[:,1]
     return M['m2'].predict_proba(np.c_[X,stackf(p)])[:,1]
@@ -354,7 +364,7 @@ def analyze(M,l,n=1):
     plt.tight_layout(); buf=io.BytesIO(); plt.savefig(buf,format='png',dpi=80); plt.close(fig)
     return {'n':n,'file':l.get('_file',''),'id':l.get('id',''),'length':k,'guess':guess,'alts':alts,'png':buf.getvalue()}
 def predict(model,paths,outdir):
-    M=pickle.load(open(model,'rb')) if isinstance(model,str) else model
+    M=load_model(model) if isinstance(model,str) else model
     os.makedirs(outdir,exist_ok=True); lines=[]; results=[]
     for n,l in enumerate(read_any(paths),1):
         r=analyze(M,l,n); f=os.path.join(outdir,f'drawing_{n}.png'); open(f,'wb').write(r['png'])
