@@ -67,10 +67,9 @@ code{background:#f0efe9;padding:1px 5px;border-radius:4px;font-size:13px}ol{padd
     <a class="btn sec" href="/download/model.pkl">Trained model</a>
     <h2 style="margin-top:16px">3 · Use it</h2>
     <ol>
-      <li><code>pip install numpy scipy scikit-learn scikit-image matplotlib</code></li>
-      <li><code>python invisible_ink.py train air-ink-pool.jsonl</code></li>
-      <li>In the live game, download the 6 recordings, then<br><code>python invisible_ink.py predict *.json --out out</code></li>
-      <li>Open <code>out/drawing_N.png</code>. Read the black ink yourself, and use the auto guess for letters you can't tell apart.</li>
+      <li>During the game, download the 6 recordings and drop them into the <b>⚡ Predict</b> box above.</li>
+      <li>Read the black ink in each picture; use the auto guess and the top 3 options when two letters look alike.</li>
+      <li>Backup: the <a href="https://github.com/AaryanPanda/github-invisible-ink-pool-tds-assignment/blob/main/invisible_ink.ipynb">Colab notebook</a> runs the same predictor in your browser.</li>
     </ol>
   </div>
 </div>
@@ -122,9 +121,8 @@ const d=$('drop');d.onclick=()=>$('file').click();$('file').onchange=e=>send(e.t
 ['dragleave','drop'].forEach(ev=>d.addEventListener(ev,e=>{e.preventDefault();d.classList.remove('hover')}));
 d.addEventListener('drop',e=>send(e.dataTransfer.files));
 function mstatus(m){
-  let t=m.trained_on?`Model trained on ${m.trained_on} recordings (${m.when.replace('T',' ')} UTC, took ${m.seconds}s).`:'No model yet.';
-  if(m.training)t+=` Retraining with new data… ${m.training_for}s so far (this can take several minutes on the free server; the current model still works).`;
-  if(m.error)t+=` Last training error: ${m.error}`;
+  let t=m.trained_on?`Model trained on ${m.trained_on} recordings (${m.when.replace('T',' ')} UTC).`:'No model yet. The first one arrives within about an hour of the first upload.';
+  if(m.trained_on && m.pool>m.trained_on)t+=` The pool now has ${m.pool}; the model updates automatically within about an hour.`;
   $('mstat').textContent=t;
 }
 async function predict(files){
