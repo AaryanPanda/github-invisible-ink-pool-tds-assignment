@@ -278,6 +278,13 @@ def dedup(L):
         key=tuple(round(v,2) for r in l['samples'][:60] for v in r[1:3])
         if key not in seen: seen.add(key); out.append(l)
     return out
+class SoftSVC:
+    """SVC + scaler with softmax over one-vs-rest decision scores (no costly probability calibration)."""
+    def __init__(self,sc,svc): self.sc=sc; self.svc=svc
+    def predict_proba(self,X):
+        d=self.svc.decision_function(self.sc.transform(np.asarray(X,np.float32)))
+        full=np.full((len(d),JUNK+1),-1e3); full[:,self.svc.classes_]=d*3
+        e=np.exp(full-full.max(1,keepdims=True)); return e/e.sum(1,keepdims=True)
 def train(paths, out):
     L=dedup([l for l in read_any(paths) if 'code' in l])
     print(f'training on {len(L)} unique labelled recordings')
@@ -361,5 +368,6 @@ if __name__=='__main__':
     t=sub.add_parser('train'); t.add_argument('files',nargs='+'); t.add_argument('--model',default='ink_model.pkl')
     p=sub.add_parser('predict'); p.add_argument('files',nargs='+'); p.add_argument('--model',default='ink_model.pkl'); p.add_argument('--out',default='out')
     a=ap.parse_args()
-    if a.cmd=='train': train(sum([glob.glob(f) for f in a.files],[]),a.model)
-    else: predict(a.model,sum([glob.glob(f) for f in a.files],[]),a.out)
+    import invisible_ink as _mod   # run via the module name so pickled classes load anywhere
+    if a.cmd=='train': _mod.train(sum([glob.glob(f) for f in a.files],[]),a.model)
+    else: _mod.predict(a.model,sum([glob.glob(f) for f in a.files],[]),a.out)
