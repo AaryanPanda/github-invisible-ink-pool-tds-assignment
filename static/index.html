@@ -25,6 +25,7 @@ code{background:#f0efe9;padding:1px 5px;border-radius:4px;font-size:13px}ol{padd
 .del{background:var(--bad);padding:3px 8px;font-size:12px}
 .res{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px;margin-top:12px}
 .res .card{padding:12px}.res img{width:100%;border-radius:6px;border:1px solid var(--line)}
+.lenrow{margin:6px 0;font-size:13px}.lenb{background:#fff;color:var(--acc);border:1px solid var(--acc);padding:2px 10px;margin:0 2px;font-size:13px}.lenb.on{background:var(--acc);color:#fff}
 .guess{font:700 22px ui-monospace,Menlo,monospace;letter-spacing:3px}.alts{color:var(--mut);font:13px ui-monospace,Menlo,monospace}
 #pdrop{border:2px dashed var(--acc);border-radius:10px;padding:22px;text-align:center;color:var(--acc);cursor:pointer;background:#f3f6fd}
 #pdrop.hover{background:#e4ebfa}.status{font-size:13px;color:var(--mut);margin:8px 0 0}
@@ -47,7 +48,7 @@ code{background:#f0efe9;padding:1px 5px;border-radius:4px;font-size:13px}ol{padd
   <div id="pmsg"></div>
   <div id="pcopy"></div>
   <div class="res" id="res"></div>
-  <p class="status">Test recordings are processed in memory and never stored. Black lines show the predicted ink and red dotted lines show where one letter ends and the next begins. Read the picture yourself; the auto guess gets about 40% of letters right. Use the top 3 options when two letters look alike.</p>
+  <p class="status">Test recordings are processed in memory and never stored. Black lines show the predicted ink and red dotted lines show where one letter ends and the next begins. Read the picture yourself first. Then count the letters and click 3, 4 or 5: on unseen test drawings the auto guess got about half the letters right with the count, under a third without it. Use the top 3 options when two letters look alike.</p>
 </div>
 
 <div class="grid two">
@@ -130,19 +131,43 @@ function mstatus(m){
   if(m.trained_on && m.pool>m.trained_on)t+=` The pool now has ${m.pool}; the model updates automatically within about an hour.`;
   $('mstat').textContent=t;
 }
+let lastFiles=[];
+function card(x){
+  const btns=[3,4,5].map(k=>`<button class="lenb${x.length==k?' on':''}" onclick="rerun(${x.n},${k})">${k}</button>`).join('');
+  return `<div class="card" id="card${x.n}"><div><b>#${x.n}</b> <span class="alts">${esc(x.file)}</span></div>
+    <div class="guess">${esc(x.guess)}</div><div class="alts">top-3 per letter: ${x.alts.map(esc).join(' · ')}</div>
+    <div class="lenrow">Count the letters in the picture: ${btns} <span class="alts">${x.length?`(reading as ${x.length} letters)`:'(length guessed)'}</span></div>
+    <a href="data:image/png;base64,${x.png}" target="_blank"><img src="data:image/png;base64,${x.png}"></a></div>`;
+}
+let results={};
+function copyAll(){navigator.clipboard.writeText(Object.values(results).sort((a,b)=>a.n-b.n).map(x=>`Drawing ${x.n}: ${x.guess}`).join('\n'))}
 async function predict(files){
+  lastFiles=[...files]; results={};
   const fd=new FormData();for(const f of files)fd.append('files',f);
   $('pmsg').className='';$('pmsg').textContent=`Analysing ${files.length} file(s)… (free server: allow ~10–40 s)`;$('res').innerHTML='';$('pcopy').innerHTML='';
   try{
     const r=await fetch('/api/predict',{method:'POST',body:fd});const j=await r.json();
     if(!r.ok)throw new Error(j.detail||r.statusText);
-    $('pmsg').className='ok';$('pmsg').textContent=`✓ ${j.results.length} drawing(s), model trained on ${j.model_trained_on} recordings`;
-    const all=j.results.map(x=>`Drawing ${x.n}: ${x.guess}`).join('\n');
-    $('pcopy').innerHTML=`<button class="sec btn" id="cp">Copy all guesses</button>`;$('cp').onclick=()=>navigator.clipboard.writeText(all);
-    $('res').innerHTML=j.results.map(x=>`<div class="card"><div><b>#${x.n}</b> <span class="alts">${esc(x.file)} · length ${x.length??'?'}</span></div>
-      <div class="guess">${esc(x.guess)}</div><div class="alts">top-3 per letter: ${x.alts.map(esc).join(' · ')}</div>
-      <a href="data:image/png;base64,${x.png}" target="_blank"><img src="data:image/png;base64,${x.png}"></a></div>`).join('');
+    $('pmsg').className='ok';$('pmsg').textContent=`✓ ${j.results.length} drawing(s), model trained on ${j.model_trained_on} recordings. Tip: count the letters in each picture and click 3, 4 or 5; that makes the guess much better.`;
+    j.results.forEach(x=>results[x.n]=x);
+    $('pcopy').innerHTML=`<button class="sec btn" onclick="copyAll()">Copy all guesses</button>`;
+    $('res').innerHTML=j.results.map(card).join('');
   }catch(e){$('pmsg').className='bad';$('pmsg').textContent='✗ '+e.message}
+}
+async function rerun(n,k){
+  const el=$('card'+n); el.style.opacity=.5;
+  const onePerFile=lastFiles.length===Object.keys(results).length;
+  const fd=new FormData();
+  if(onePerFile){fd.append('files',lastFiles[n-1]);fd.append('lengths',JSON.stringify([k]));fd.append('start',n);}
+  else{ // several drawings inside one file: send all, change only this drawing's length
+    for(const f of lastFiles)fd.append('files',f);
+    const ks=Object.values(results).sort((a,b)=>a.n-b.n).map(x=>x.n===n?k:(x.length||null));
+    fd.append('lengths',JSON.stringify(ks));fd.append('start',1);}
+  try{
+    const r=await fetch('/api/predict',{method:'POST',body:fd});const j=await r.json();
+    if(!r.ok)throw new Error(j.detail||r.statusText);
+    const x=j.results.find(z=>z.n===n)||j.results[0]; results[n]=x; el.outerHTML=card(x);
+  }catch(e){el.style.opacity=1;alert('Could not re-read: '+e.message)}
 }
 const pd=$('pdrop');pd.onclick=()=>$('pfile').click();$('pfile').onchange=e=>predict(e.target.files);
 ['dragover','dragenter'].forEach(ev=>pd.addEventListener(ev,e=>{e.preventDefault();pd.classList.add('hover')}));
