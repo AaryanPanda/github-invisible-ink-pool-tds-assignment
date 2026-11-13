@@ -7,7 +7,7 @@ import io, json, hashlib, zipfile, datetime, collections
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse, JSONResponse
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey, LargeBinary, func
-import base64, gc, pickle, threading, time
+import base64, gc, hmac, pickle, threading, time
 _predict_lock = threading.Lock()   # one prediction at a time keeps memory far below 512 MB
 from typing import List
 from sqlalchemy.orm import declarative_base, sessionmaker
@@ -79,6 +79,10 @@ with engine.begin() as _c:            # add the fps column to an existing table 
 
 # ---------- model: trained by GitHub Actions (7 GB RAM), uploaded via /api/model ----------
 _model_cache = {"id": None, "model": None}
+
+def is_admin(request: Request, token: str = "") -> bool:
+    given = request.headers.get("x-admin-token") or token
+    return bool(ADMIN_TOKEN) and hmac.compare_digest(given.encode(), ADMIN_TOKEN.encode())
 
 def pool_size():
     with Session() as db:
@@ -166,13 +170,16 @@ def drop_empty_uploads():
         db.commit()
 
 def compact_uploads():
-    """One-time: replace full file copies by fingerprints + at most MAX_DUPLICATES duplicate records."""
+    """One-time: replace full file copies by fingerprints + at most MAX_DUPLICATES duplicate records.
+    Processes one upload at a time so memory stays low."""
     with Session() as db:
-        ups = db.query(Upload).filter(Upload.fps.is_(None)).order_by(Upload.id).all()
-        if not ups: return
+        ids = [i for (i,) in db.query(Upload.id).filter(Upload.fps.is_(None)).order_by(Upload.id).all()]
+        if not ids: return
         owner = {f: u for f, u in db.query(Recording.fingerprint, Recording.upload_id).all()}
         budget = MAX_DUPLICATES - stored_duplicates(db)
-        for u in ups:
+    for uid in ids:
+        with Session() as db:
+            u = db.get(Upload, uid)
             try:
                 good, _ = parse(u.raw) if u.raw else ([], [])
             except Exception:
@@ -183,7 +190,8 @@ def compact_uploads():
                 if owner.get(fp) != u.id and budget > 0:
                     dups.append(json.dumps(r, separators=(",", ":"))); budget -= 1
             u.fps = json.dumps(fps); u.raw = "\n".join(dups)
-        db.commit()
+            db.commit()
+        del good
 
 @app.get("/", response_class=HTMLResponse)
 def home():
@@ -296,8 +304,8 @@ def download_script():
     return FileResponse(os.path.join(HERE, "invisible_ink.py"), filename="invisible_ink.py", media_type="text/x-python")
 
 @app.delete("/api/upload/{uid}")
-def delete_upload(uid: int, token: str = Query("")):
-    if not ADMIN_TOKEN or token != ADMIN_TOKEN:
+def delete_upload(uid: int, request: Request, token: str = Query("")):
+    if not is_admin(request, token):
         raise HTTPException(403, "Bad admin token.")
     with Session() as db:
         others = {}
@@ -351,9 +359,9 @@ def predict(files: List[UploadFile] = File(...)):
         _predict_lock.release()
 
 @app.post("/api/model")
-def upload_model(file: UploadFile = File(...), n_recordings: int = Form(...), seconds: int = Form(0), token: str = Query("")):
+def upload_model(request: Request, file: UploadFile = File(...), n_recordings: int = Form(...), seconds: int = Form(0), token: str = Query("")):
     """Admin only (called by the GitHub Action). The pickle is only ever loaded from this trusted source."""
-    if not ADMIN_TOKEN or token != ADMIN_TOKEN:
+    if not is_admin(request, token):
         raise HTTPException(403, "Bad admin token.")
     blob = file.file.read(200 * 1024 * 1024)
     _predict_lock.acquire()
