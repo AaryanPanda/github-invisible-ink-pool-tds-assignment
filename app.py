@@ -17,6 +17,7 @@ if DB_URL.startswith("postgres://"):
     DB_URL = DB_URL.replace("postgres://", "postgresql://", 1)
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
 MAX_BYTES = 15 * 1024 * 1024
+UPLOADS_OPEN = os.environ.get("UPLOADS_OPEN", "0") == "1"   # closed: the pool is final
 MAX_DUPLICATES = 100                    # cap for duplicate copies kept from older uploads (new uploads keep none)
 ALPHABET = set("ACEFHJKMNPRTUVWXY")
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -110,7 +111,7 @@ app = FastAPI(title="Invisible Ink Pool")
 
 @app.on_event("startup")
 def _startup():
-    for step in (compact_uploads, drop_empty_uploads):
+    for step in (compact_uploads, drop_empty_uploads, purge_duplicates):
         try:
             step()
         except Exception as e:
@@ -169,6 +170,13 @@ def drop_empty_uploads():
                 bump(db, "skipped_records", (u.n_records or 0) - (u.n_new or 0)); bump(db, f"counted_{u.id}", 1)
         db.commit()
 
+def purge_duplicates():
+    """Final pool: keep only unique recordings; drop every stored duplicate copy."""
+    with Session() as db:
+        n = db.query(Upload).filter(Upload.raw.isnot(None), Upload.raw != "").update({Upload.raw: ""}, synchronize_session=False)
+        db.commit()
+    if n: print(f"purged duplicate copies from {n} uploads")
+
 def compact_uploads():
     """One-time: replace full file copies by fingerprints + at most MAX_DUPLICATES duplicate records.
     Processes one upload at a time so memory stays low."""
@@ -217,12 +225,15 @@ def stats():
             "letters": {k: letters.get(k, 0) for k in sorted(ALPHABET)},
             "lengths": dict(collections.Counter(l for _, l in recs)),
             "model": _model_info(),
+            "uploads_open": UPLOADS_OPEN,
             "recent": [{"id": u.id, "when": u.created.isoformat(timespec="minutes") + "Z", "file": u.filename,
                         "note": u.note, "records": u.n_records, "new": u.n_new} for u in ups[:50]],
         }
 
 @app.post("/api/upload")
 async def upload(file: UploadFile = File(...), note: str = Form("")):
+    if not UPLOADS_OPEN:
+        raise HTTPException(403, "Uploads are closed: the pool already has enough unique recordings for training. Thank you!")
     raw = await file.read(MAX_BYTES + 1)
     if len(raw) > MAX_BYTES:
         raise HTTPException(413, "File too large (max 15 MB).")
@@ -266,17 +277,24 @@ def download_pool():
     return StreamingResponse(gen(), media_type="application/x-ndjson",
                              headers={"Content-Disposition": "attachment; filename=air-ink-pool.jsonl"})
 
+_zip_cache = {"n": None, "data": None}
+_zip_lock = threading.Lock()
+
 @app.get("/download/all.zip")
 def download_all():
-    buf = io.BytesIO()
-    with Session() as db, zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        z.writestr("air-ink-pool.jsonl", "".join(b + "\n" for (b,) in db.query(Recording.body).order_by(Recording.id)))
-        for u in db.query(Upload).order_by(Upload.id):
-            if u.raw:
-                z.writestr(f"duplicates/{u.id:04d}_{os.path.basename(u.filename or 'upload')}", u.raw)
-        z.write(os.path.join(HERE, "invisible_ink.py"), "invisible_ink.py")
-    buf.seek(0)
-    return StreamingResponse(buf, media_type="application/zip",
+    with _zip_lock:   # built once and reused: many people downloading at once stays cheap
+        n = pool_size()
+        if _zip_cache["n"] != n:
+            _zip_cache["data"] = None; gc.collect()
+            buf = io.BytesIO()
+            with Session() as db, zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+                with z.open("air-ink-pool.jsonl", "w") as f:
+                    for (b,) in db.query(Recording.body).order_by(Recording.id).yield_per(100):
+                        f.write((b + "\n").encode())
+                z.write(os.path.join(HERE, "invisible_ink.py"), "invisible_ink.py")
+            _zip_cache["data"] = buf.getvalue(); _zip_cache["n"] = n
+        data = _zip_cache["data"]
+    return StreamingResponse(io.BytesIO(data), media_type="application/zip",
                              headers={"Content-Disposition": "attachment; filename=invisible-ink-pool.zip"})
 
 @app.get("/download/model.pkl")
@@ -322,46 +340,80 @@ def delete_upload(uid: int, request: Request, token: str = Query("")):
         db.commit()
     return {"deleted": n, "recordings_removed": removed, "kept_because_others_uploaded_them": kept}
 
+import collections, hashlib
+_result_cache = collections.OrderedDict()   # same recording + same length + same model -> same answer
+_CACHE_MAX = 400                             # ~120 KB each -> under 50 MB
+_waiting = {"n": 0}
+_MAX_WAITING = 25
+
+def _rec_key(l, k, model_id):
+    h = hashlib.sha1(json.dumps(l["samples"], separators=(",", ":")).encode()).hexdigest()
+    return f"{model_id}:{k}:{h}"
+
 @app.post("/api/predict")
 def predict(files: List[UploadFile] = File(...), lengths: str = Form(""), start: int = Form(1)):
-    """Test recordings are analysed in memory and never stored. One request at a time (memory safety)."""
-    if not _predict_lock.acquire(timeout=150):
-        raise HTTPException(503, "Server busy with other predictions. Try again in a few seconds.")
+    """Test recordings are analysed in memory and never stored.
+    Results are cached by content, so a recording many students upload is computed once.
+    Uncached work runs one request at a time (memory safety) with a bounded queue."""
+    import invisible_ink as ink
+    recs = []
+    for f in files[:12]:
+        raw = f.file.read(MAX_BYTES + 1)
+        if len(raw) > MAX_BYTES: raise HTTPException(413, f"{f.filename} too large")
+        try:
+            recs += ink.parse_text(raw.decode("utf-8", errors="replace"), f.filename or "")[:12]
+        except Exception:
+            raise HTTPException(400, f"{f.filename}: could not read JSON/JSONL")
+        del raw
+        if len(recs) >= 12: break
+    recs = recs[:12]
+    if not recs:
+        raise HTTPException(400, "No recordings with 'samples' found.")
     try:
-        import invisible_ink as ink
-        M, meta = get_model()
-        if M is None:
-            raise HTTPException(503, "No model yet. Upload training data and wait for training to finish.")
-        recs = []
-        for f in files[:12]:
-            raw = f.file.read(MAX_BYTES + 1)
-            if len(raw) > MAX_BYTES: raise HTTPException(413, f"{f.filename} too large")
+        ks = json.loads(lengths) if lengths else []
+    except Exception:
+        ks = []
+    meta_m = latest_model_meta()
+    if meta_m is None:
+        raise HTTPException(503, "No model yet.")
+    jobs = []
+    for i, l in enumerate(recs):
+        n = start + i
+        k = ks[i] if i < len(ks) and ks[i] in (3, 4, 5) else None
+        jobs.append((n, l, k, _rec_key(l, k, meta_m.id)))
+    out = {}
+    for n, l, k, key in jobs:
+        if key in _result_cache:
+            r = dict(_result_cache[key]); r["n"] = n; r["file"] = l.get("_file", ""); out[n] = r
+    todo = [j for j in jobs if j[0] not in out]
+    if todo:
+        if _waiting["n"] >= _MAX_WAITING:
+            raise HTTPException(503, "Server is very busy right now. Wait 30 seconds and try again, or use the Colab notebook.")
+        _waiting["n"] += 1
+        got = _predict_lock.acquire(timeout=90)
+        _waiting["n"] -= 1
+        if not got:
+            raise HTTPException(503, "Server is busy with other predictions. Try again in a minute, or use the Colab notebook.")
+        try:
+            M, meta = get_model()
+            for n, l, k, key in todo:
+                if key in _result_cache:            # someone else computed it while we waited
+                    r = dict(_result_cache[key])
+                else:
+                    a = ink.analyze(M, l, n, k)
+                    r = {"length": a["length"], "guess": a["guess"], "alts": a["alts"],
+                         "png": base64.b64encode(a["png"]).decode(), "id": a["id"]}
+                    _result_cache[key] = r
+                    while len(_result_cache) > _CACHE_MAX: _result_cache.popitem(last=False)
+                r = dict(r); r["n"] = n; r["file"] = l.get("_file", ""); out[n] = r
+        finally:
             try:
-                recs += ink.parse_text(raw.decode("utf-8", errors="replace"), f.filename or "")[:12]
+                import matplotlib.pyplot as plt; plt.close("all")
             except Exception:
-                raise HTTPException(400, f"{f.filename}: could not read JSON/JSONL")
-            del raw
-            if len(recs) >= 12: break
-        if not recs:
-            raise HTTPException(400, "No recordings with 'samples' found.")
-        out = []
-        try:
-            ks = json.loads(lengths) if lengths else []
-        except Exception:
-            ks = []
-        for n, l in enumerate(recs[:12], start):
-            k = ks[n - start] if n - start < len(ks) else None
-            r = ink.analyze(M, l, n, k if k in (3, 4, 5) else None)
-            out.append({"n": n, "file": r["file"], "id": r["id"], "length": r["length"], "guess": r["guess"],
-                        "alts": r["alts"], "png": base64.b64encode(r["png"]).decode()})
-        return {"model_trained_on": meta.n_recordings, "results": out}
-    finally:
-        try:
-            import matplotlib.pyplot as plt; plt.close("all")
-        except Exception:
-            pass
-        gc.collect()
-        _predict_lock.release()
+                pass
+            gc.collect()
+            _predict_lock.release()
+    return {"model_trained_on": meta_m.n_recordings, "results": [out[n] for n, *_ in jobs]}
 
 @app.post("/api/model")
 def upload_model(request: Request, file: UploadFile = File(...), n_recordings: int = Form(...), seconds: int = Form(0), token: str = Query("")):
@@ -390,6 +442,7 @@ def upload_model(request: Request, file: UploadFile = File(...), n_recordings: i
         if old:
             db.query(Model).filter(Model.id.in_(old)).delete(synchronize_session=False); db.commit()
     _model_cache["id"] = None; _model_cache["model"] = None
+    _result_cache.clear(); gc.collect()
     return {"ok": True, "n_recordings": n_recordings}
 
 
