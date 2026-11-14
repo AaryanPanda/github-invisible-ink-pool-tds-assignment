@@ -98,7 +98,12 @@ async function load(){
   const r=L.slice().sort((a,b)=>a[1]-b[1])[0];$('k4').textContent=r?`${r[0]} · ${r[1]}`:'–';
   $('bars').innerHTML=L.map(([k,v])=>`<div class="bar" style="height:${v/mx*100}%"><span>${v}</span></div>`).join('');
   $('lbls').innerHTML=L.map(([k])=>`<div>${k}</div>`).join('');
-  mstatus(s.model);if(admin)$('admh').textContent='Admin';
+  mstatus(s.model);
+  if(s.uploads_open===false && $('drop')){
+    $('drop').closest('.card').innerHTML=`<h2>1 · Uploads are closed</h2>
+      <p>The pool already has <b>${s.unique_recordings}</b> unique recordings, which is enough for training. Thank you to everyone who contributed!</p>
+      <p style="color:var(--mut);font-size:13px">You can still download the pooled data and the Colab notebook on the right.</p>`;
+  }if(admin)$('admh').textContent='Admin';
   $('ups').innerHTML=s.recent.map(u=>`<tr><td>${u.id}</td><td>${esc(ist(u.when))}</td><td>${esc(u.file)}</td><td>${esc(u.note)}</td><td>${u.records}</td><td>${u.new}</td>${admin?`<td><button class="del" onclick="del(${u.id})">Delete</button></td>`:''}</tr>`).join('')||'<tr><td colspan="6">No uploads yet. Be the first!</td></tr>';
 }
 async function send(files){
@@ -144,7 +149,7 @@ function copyAll(){navigator.clipboard.writeText(Object.values(results).sort((a,
 async function predict(files){
   lastFiles=[...files]; results={};
   const fd=new FormData();for(const f of files)fd.append('files',f);
-  $('pmsg').className='';$('pmsg').textContent=`Analysing ${files.length} file(s)… (free server: allow ~10–40 s)`;$('res').innerHTML='';$('pcopy').innerHTML='';
+  $('pmsg').className='';$('pmsg').textContent=`Analysing ${files.length} file(s)… Usually 5–40 s; during the live game you may wait in a short queue. Don't refresh.`;$('res').innerHTML='';$('pcopy').innerHTML='';
   try{
     const r=await fetch('/api/predict',{method:'POST',body:fd});const j=await r.json();
     if(!r.ok)throw new Error(j.detail||r.statusText);
@@ -152,7 +157,7 @@ async function predict(files){
     j.results.forEach(x=>results[x.n]=x);
     $('pcopy').innerHTML=`<button class="sec btn" onclick="copyAll()">Copy all guesses</button>`;
     $('res').innerHTML=j.results.map(card).join('');
-  }catch(e){$('pmsg').className='bad';$('pmsg').textContent='✗ '+e.message}
+  }catch(e){$('pmsg').className='bad';$('pmsg').textContent='✗ '+e.message+(/busy|503/i.test(e.message)?'':' If this keeps happening, use the Colab notebook (Download → Colab notebook).')}
 }
 async function rerun(n,k){
   const el=$('card'+n); el.style.opacity=.5;
